@@ -67,9 +67,14 @@ func GetRPCNodes(rpcAddress string, retries int, denylist []string, privateRPC b
 
 	nodes := []RPCNode{}
 	addresses := []string{}
+	deniedCount := 0     // Track actual denylist denials
+	rpcNodeCount := 0    // Track nodes with RPC endpoints
+	gossipNodeCount := 0 // Track nodes with Gossip endpoints
+
 	for _, node := range result.Result {
 		// Handle regular RPC nodes
 		if node.RPC != "" {
+			rpcNodeCount++
 			rpcIP := strings.Split(node.RPC, ":")[0]
 
 			// Check if the IP is denied
@@ -77,6 +82,7 @@ func GetRPCNodes(rpcAddress string, retries int, denylist []string, privateRPC b
 			for _, blocked := range denylist {
 				if rpcIP == blocked {
 					isDenied = true
+					deniedCount++
 					log.Printf("Node %s denied by config (IP %s is in denylist)", node.RPC, rpcIP)
 					break
 				}
@@ -93,6 +99,7 @@ func GetRPCNodes(rpcAddress string, retries int, denylist []string, privateRPC b
 
 		// Handle private RPC nodes
 		if privateRPC && node.Gossip != "" {
+			gossipNodeCount++
 			gossipIP := strings.Split(node.Gossip, ":")[0] // Extract gossip IP
 			privateRPCAddress := fmt.Sprintf("%s:8899", gossipIP)
 
@@ -101,6 +108,7 @@ func GetRPCNodes(rpcAddress string, retries int, denylist []string, privateRPC b
 			for _, blocked := range denylist {
 				if gossipIP == blocked {
 					isDenied = true
+					deniedCount++
 					log.Printf("Private node %s denied by config (IP %s is in denylist)", privateRPCAddress, gossipIP)
 					break
 				}
@@ -118,7 +126,11 @@ func GetRPCNodes(rpcAddress string, retries int, denylist []string, privateRPC b
 
 	// Log summary of denylist filtering
 	if len(denylist) > 0 {
-		log.Printf("Denylist filtering complete: %d nodes available, %d nodes denied by config", len(nodes), len(result.Result)-len(nodes))
+		log.Printf("Denylist filtering complete: %d nodes available, %d nodes denied by config", len(nodes), deniedCount)
+		log.Printf("Total nodes from cluster: %d, RPC nodes: %d, Gossip nodes: %d",
+			len(result.Result), rpcNodeCount, gossipNodeCount)
+		log.Printf("Nodes without RPC endpoints: %d (these are not counted as 'denied')",
+			len(result.Result)-rpcNodeCount-gossipNodeCount)
 	}
 
 	return nodes, addresses, nil

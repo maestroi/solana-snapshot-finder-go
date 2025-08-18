@@ -1,4 +1,51 @@
-run.sh
-config.yaml
+# Binary files
 solana-snapshot-finder
-./snapshots
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Configuration files (user-specific)
+config.yaml
+config.local.yaml
+
+# Scripts
+run.sh
+
+# Snapshot directories
+snapshots/
+snapshots/*
+./snapshots/
+
+# Temporary files
+tmp/
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Go specific
+*.test
+*.prof
+*.out
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Backup files
+*.bak
+*.backup

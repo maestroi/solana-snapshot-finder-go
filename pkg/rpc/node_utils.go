@@ -198,8 +198,23 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			diff := defaultSlot - slot
 			status := "slow" // Default to slow for partially functional nodes
 
-			// Check if node meets all requirements for "good" status
-			if speed >= float64(cfg.MinDownloadSpeed) && latency <= float64(cfg.MaxLatency) && diff <= 100 {
+			// For node evaluation, we always prioritize finding nodes that can provide
+			// full snapshots within the full_threshold. The incremental threshold is only
+			// used later when we check local files and determine what's actually needed.
+			slotThreshold := cfg.FullThreshold
+			if slotThreshold == 0 {
+				slotThreshold = 25000 // Default fallback if not configured
+			}
+
+			// Strict slot validation: reject nodes outside the full threshold
+			// We want full snapshots as close as possible to current slot height
+			if diff > slotThreshold {
+				log.Printf("Node %s rejected: slot too old (diff: %d, max allowed: %d)", rpc, diff, slotThreshold)
+				appendResult(node, rpc, speed, latency, slot, diff, "bad")
+				return
+			}
+
+			if speed >= float64(cfg.MinDownloadSpeed) && latency <= float64(cfg.MaxLatency) && diff <= slotThreshold {
 				status = "good"
 			} else if speed == 0 || latency == 0 {
 				// Only mark as "bad" if completely failed (no speed or no latency response)
@@ -221,7 +236,12 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	}
 
 	sort.Slice(evaluatedResults, func(i, j int) bool {
-		return evaluatedResults[i].Speed > evaluatedResults[j].Speed
+		// Primary sort: by speed (fastest first)
+		if evaluatedResults[i].Speed != evaluatedResults[j].Speed {
+			return evaluatedResults[i].Speed > evaluatedResults[j].Speed
+		}
+		// Secondary sort: by slot difference (closest to reference slot first)
+		return evaluatedResults[i].Diff < evaluatedResults[j].Diff
 	})
 
 	log.Printf("Node evaluation complete: %d/%d nodes processed | Good: %d, Slow: %d, Bad: %d",
@@ -229,6 +249,11 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 		atomic.LoadInt32(&goodNodes),
 		atomic.LoadInt32(&slowNodes),
 		atomic.LoadInt32(&badNodes))
+
+	// Log slot threshold information
+	log.Printf("Node evaluation: using full threshold %d slots for full snapshots (reference slot: %d)",
+		cfg.FullThreshold, defaultSlot)
+	log.Printf("Note: Incremental threshold %d slots is used later when checking local files", cfg.IncrementalThreshold)
 
 	return evaluatedResults
 }
@@ -238,6 +263,8 @@ func EvaluateNodesWithRelaxedRequirements(nodes []RPCNode, cfg config.Config, de
 	// Calculate relaxed requirements based on attempt number
 	relaxedSpeed := float64(cfg.MinDownloadSpeed)
 	relaxedLatency := float64(cfg.MaxLatency)
+	// Slot threshold remains strict - we don't want to relax this requirement
+	// as it could lead to downloading outdated snapshots
 
 	if attempt > 1 && attempt <= cfg.MaxRelaxationAttempts {
 		// Apply relaxation factor for each attempt beyond the first
@@ -245,16 +272,18 @@ func EvaluateNodesWithRelaxedRequirements(nodes []RPCNode, cfg config.Config, de
 		for i := 1; i < attempt; i++ {
 			relaxedSpeed = relaxedSpeed * cfg.SpeedRelaxationFactor
 			relaxedLatency = relaxedLatency / cfg.LatencyRelaxationFactor
+			// Slot threshold stays the same - no relaxation
 		}
 
-		log.Printf("Attempt %d: Relaxed requirements - Speed: %.2f MB/s (from %d), Latency: %.2f ms (from %d)",
-			attempt, relaxedSpeed, cfg.MinDownloadSpeed, relaxedLatency, cfg.MaxLatency)
+		log.Printf("Attempt %d: Relaxed requirements - Speed: %.2f MB/s (from %d), Latency: %.2f ms (from %d), Slot threshold: %d (strict, no relaxation)",
+			attempt, relaxedSpeed, cfg.MinDownloadSpeed, relaxedLatency, cfg.MaxLatency, cfg.FullThreshold)
 	}
 
 	// Create a temporary config with relaxed requirements for this evaluation
 	relaxedConfig := cfg
 	relaxedConfig.MinDownloadSpeed = int(relaxedSpeed)
 	relaxedConfig.MaxLatency = int(relaxedLatency)
+	// Keep original slot threshold - no relaxation
 
 	return EvaluateNodesWithVersions(nodes, relaxedConfig, defaultSlot)
 }

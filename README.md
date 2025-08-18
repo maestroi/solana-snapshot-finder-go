@@ -65,6 +65,7 @@ With the default settings above, the relaxation works as follows:
    - Evaluates multiple RPC nodes for performance metrics
    - Selects the fastest and most reliable RPC node for downloads
    - Supports denylisting of problematic nodes
+   - **Smart Slot Validation**: Prevents downloading from extremely old nodes that could cause sync issues
 
 5. **Adaptive Retry with Relaxed Requirements**:
    - If no suitable RPC nodes meet initial speed/latency requirements, automatically retries with relaxed criteria
@@ -97,8 +98,17 @@ When integrated with Solana validator startup, the tool will:
 - **Retry Relaxation Algorithm**: 
   - On each retry attempt, reduces speed requirements by dividing by `speed_relaxation_factor * attempt_number`
   - Increases latency tolerance by multiplying by `latency_relaxation_factor * attempt_number`
+  - **Relaxes slot thresholds** to allow older but still usable nodes on retry attempts
   - Saves evaluation results for each attempt to `nodes_attempt_N.json` files
   - Continues until suitable nodes are found or maximum attempts are reached
+
+- **Slot Validation Logic**:
+  - **Node Evaluation**: Always uses `full_threshold` (default: 25,000 slots) to find nodes capable of providing recent full snapshots
+  - **Local File Check**: Uses `incremental_threshold` (default: 500 slots) only when checking existing local snapshots
+  - **Smart Workflow**: First finds nodes with good full snapshots, then determines if incremental is needed based on local state
+  - **Strict requirement**: Slot difference must be within full threshold during node evaluation (no relaxation)
+  - Prioritizes nodes with closest slot to reference for most recent snapshots
+  - Logs slot validation decisions for transparency and debugging
 
 ## Best Practices
 
