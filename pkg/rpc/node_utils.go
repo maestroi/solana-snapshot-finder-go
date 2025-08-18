@@ -17,6 +17,17 @@ import (
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 )
 
+// NodeEvaluationResult represents the result of evaluating an RPC node
+type NodeEvaluationResult struct {
+	RPC     string  `json:"rpc"`
+	Speed   float64 `json:"speed"`
+	Latency float64 `json:"latency"`
+	Slot    int     `json:"slot"`
+	Diff    int     `json:"diff"`
+	Version string  `json:"version"`
+	Status  string  `json:"status"`
+}
+
 func MeasureSpeed(url string, measureTime int) (float64, float64, error) {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -76,25 +87,9 @@ func calculateMedian(values []float64) float64 {
 	return values[n/2]
 }
 
-func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot int) []struct {
-	rpc     string
-	speed   float64
-	latency float64
-	slot    int
-	diff    int
-	version string
-	status  string
-} {
+func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot int) []NodeEvaluationResult {
 	var wg sync.WaitGroup
-	results := make(chan struct {
-		rpc     string
-		speed   float64
-		latency float64
-		slot    int
-		diff    int
-		version string
-		status  string
-	}, len(nodes))
+	results := make(chan NodeEvaluationResult, len(nodes))
 	done := make(chan bool)
 
 	// Create a semaphore to limit concurrent goroutines
@@ -125,22 +120,14 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	}()
 
 	appendResult := func(node RPCNode, rpc string, speed, latency float64, slot, diff int, status string) {
-		results <- struct {
-			rpc     string
-			speed   float64
-			latency float64
-			slot    int
-			diff    int
-			version string
-			status  string
-		}{
-			rpc:     rpc,
-			speed:   speed,
-			latency: latency,
-			slot:    slot,
-			diff:    diff,
-			version: node.Version,
-			status:  status,
+		results <- NodeEvaluationResult{
+			RPC:     rpc,
+			Speed:   speed,
+			Latency: latency,
+			Slot:    slot,
+			Diff:    diff,
+			Version: node.Version,
+			Status:  status,
 		}
 
 		processed := atomic.AddInt32(&processedNodes, 1)
@@ -209,12 +196,16 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			}
 
 			diff := defaultSlot - slot
-			status := "slow"
+			status := "slow" // Default to slow for partially functional nodes
+
+			// Check if node meets all requirements for "good" status
 			if speed >= float64(cfg.MinDownloadSpeed) && latency <= float64(cfg.MaxLatency) && diff <= 100 {
 				status = "good"
-			} else if speed == 0 || latency > float64(cfg.MaxLatency) {
+			} else if speed == 0 || latency == 0 {
+				// Only mark as "bad" if completely failed (no speed or no latency response)
 				status = "bad"
 			}
+			// Otherwise keep as "slow" for nodes that are functional but don't meet requirements
 
 			appendResult(node, rpc, speed, latency, slot, diff, status)
 		}(node)
@@ -224,21 +215,13 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	done <- true
 	close(results)
 
-	var evaluatedResults []struct {
-		rpc     string
-		speed   float64
-		latency float64
-		slot    int
-		diff    int
-		version string
-		status  string
-	}
+	var evaluatedResults []NodeEvaluationResult
 	for result := range results {
 		evaluatedResults = append(evaluatedResults, result)
 	}
 
 	sort.Slice(evaluatedResults, func(i, j int) bool {
-		return evaluatedResults[i].speed > evaluatedResults[j].speed
+		return evaluatedResults[i].Speed > evaluatedResults[j].Speed
 	})
 
 	log.Printf("Node evaluation complete: %d/%d nodes processed | Good: %d, Slow: %d, Bad: %d",
@@ -250,22 +233,40 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	return evaluatedResults
 }
 
-func summarizeResultsWithVersions(results []struct {
-	rpc     string
-	speed   float64
-	latency float64
-	slot    int
-	diff    int
-	version string
-	status  string
-}) {
+// EvaluateNodesWithRelaxedRequirements evaluates nodes with gradually relaxed requirements on each retry
+func EvaluateNodesWithRelaxedRequirements(nodes []RPCNode, cfg config.Config, defaultSlot int, attempt int) []NodeEvaluationResult {
+	// Calculate relaxed requirements based on attempt number
+	relaxedSpeed := float64(cfg.MinDownloadSpeed)
+	relaxedLatency := float64(cfg.MaxLatency)
+
+	if attempt > 1 && attempt <= cfg.MaxRelaxationAttempts {
+		// Apply relaxation factor for each attempt beyond the first
+		// Each attempt multiplies the previous relaxation
+		for i := 1; i < attempt; i++ {
+			relaxedSpeed = relaxedSpeed * cfg.SpeedRelaxationFactor
+			relaxedLatency = relaxedLatency / cfg.LatencyRelaxationFactor
+		}
+
+		log.Printf("Attempt %d: Relaxed requirements - Speed: %.2f MB/s (from %d), Latency: %.2f ms (from %d)",
+			attempt, relaxedSpeed, cfg.MinDownloadSpeed, relaxedLatency, cfg.MaxLatency)
+	}
+
+	// Create a temporary config with relaxed requirements for this evaluation
+	relaxedConfig := cfg
+	relaxedConfig.MinDownloadSpeed = int(relaxedSpeed)
+	relaxedConfig.MaxLatency = int(relaxedLatency)
+
+	return EvaluateNodesWithVersions(nodes, relaxedConfig, defaultSlot)
+}
+
+func summarizeResultsWithVersions(results []NodeEvaluationResult) {
 	totalNodes := len(results)
 	goodNodes := 0
 	slowNodes := 0
 	badNodes := 0
 
 	for _, result := range results {
-		switch result.status {
+		switch result.Status {
 		case "good":
 			goodNodes++
 		case "slow":
@@ -280,22 +281,14 @@ func summarizeResultsWithVersions(results []struct {
 
 	log.Println("List of good nodes:")
 	for _, result := range results {
-		if result.status == "good" {
+		if result.Status == "good" {
 			log.Printf("Node: %s | Speed: %.2f MB/s | Latency: %.2f ms | Slot: %d | Diff: %d | Version: %s",
-				result.rpc, result.speed, result.latency, result.slot, result.diff, result.version)
+				result.RPC, result.Speed, result.Latency, result.Slot, result.Diff, result.Version)
 		}
 	}
 }
 
-func dumpGoodAndSlowNodesToFile(results []struct {
-	rpc     string
-	speed   float64
-	latency float64
-	slot    int
-	diff    int
-	version string
-	status  string
-}, outputFile string) {
+func dumpGoodAndSlowNodesToFile(results []NodeEvaluationResult, outputFile string) {
 	var filteredNodes []struct {
 		RPC     string  `json:"rpc"`
 		Speed   float64 `json:"speed"`
@@ -306,26 +299,25 @@ func dumpGoodAndSlowNodesToFile(results []struct {
 		Status  string  `json:"status"`
 	}
 
+	// Save all nodes regardless of status to help with debugging
 	for _, result := range results {
-		if result.status == "good" || result.status == "slow" {
-			filteredNodes = append(filteredNodes, struct {
-				RPC     string  `json:"rpc"`
-				Speed   float64 `json:"speed"`
-				Latency float64 `json:"latency"`
-				Slot    int     `json:"slot"`
-				Diff    int     `json:"diff"`
-				Version string  `json:"version"`
-				Status  string  `json:"status"`
-			}{
-				RPC:     result.rpc,
-				Speed:   result.speed,
-				Latency: result.latency,
-				Slot:    result.slot,
-				Diff:    result.diff,
-				Version: result.version,
-				Status:  result.status,
-			})
-		}
+		filteredNodes = append(filteredNodes, struct {
+			RPC     string  `json:"rpc"`
+			Speed   float64 `json:"speed"`
+			Latency float64 `json:"latency"`
+			Slot    int     `json:"slot"`
+			Diff    int     `json:"diff"`
+			Version string  `json:"version"`
+			Status  string  `json:"status"`
+		}{
+			RPC:     result.RPC,
+			Speed:   result.Speed,
+			Latency: result.Latency,
+			Slot:    result.Slot,
+			Diff:    result.Diff,
+			Version: result.Version,
+			Status:  result.Status,
+		})
 	}
 
 	file, err := os.Create(outputFile)
@@ -342,25 +334,17 @@ func dumpGoodAndSlowNodesToFile(results []struct {
 		return
 	}
 
-	log.Printf("Good and slow nodes saved to %s", outputFile)
+	log.Printf("All nodes saved to %s (Total: %d)", outputFile, len(filteredNodes))
 }
 
-func SummarizeResultsWithVersions(results []struct {
-	rpc     string
-	speed   float64
-	latency float64
-	slot    int
-	diff    int
-	version string
-	status  string
-}) {
+func SummarizeResultsWithVersions(results []NodeEvaluationResult) {
 	totalNodes := len(results)
 	goodNodes := 0
 	slowNodes := 0
 	badNodes := 0
 
 	for _, result := range results {
-		switch result.status {
+		switch result.Status {
 		case "good":
 			goodNodes++
 		case "slow":
@@ -375,22 +359,14 @@ func SummarizeResultsWithVersions(results []struct {
 
 	log.Println("List of good nodes:")
 	for _, result := range results {
-		if result.status == "good" {
+		if result.Status == "good" {
 			log.Printf("Node: %s | Speed: %.2f MB/s | Latency: %.2f ms | Slot: %d | Diff: %d | Version: %s",
-				result.rpc, result.speed, result.latency, result.slot, result.diff, result.version)
+				result.RPC, result.Speed, result.Latency, result.Slot, result.Diff, result.Version)
 		}
 	}
 }
 
-func DumpGoodAndSlowNodesToFile(results []struct {
-	rpc     string
-	speed   float64
-	latency float64
-	slot    int
-	diff    int
-	version string
-	status  string
-}, outputFile string) {
+func DumpGoodAndSlowNodesToFile(results []NodeEvaluationResult, outputFile string) {
 	var filteredNodes []struct {
 		RPC     string  `json:"rpc"`
 		Speed   float64 `json:"speed"`
@@ -401,26 +377,25 @@ func DumpGoodAndSlowNodesToFile(results []struct {
 		Status  string  `json:"status"`
 	}
 
+	// Save all nodes regardless of status to help with debugging
 	for _, result := range results {
-		if result.status == "good" || result.status == "slow" {
-			filteredNodes = append(filteredNodes, struct {
-				RPC     string  `json:"rpc"`
-				Speed   float64 `json:"speed"`
-				Latency float64 `json:"latency"`
-				Slot    int     `json:"slot"`
-				Diff    int     `json:"diff"`
-				Version string  `json:"version"`
-				Status  string  `json:"status"`
-			}{
-				RPC:     result.rpc,
-				Speed:   result.speed,
-				Latency: result.latency,
-				Slot:    result.slot,
-				Diff:    result.diff,
-				Version: result.version,
-				Status:  result.status,
-			})
-		}
+		filteredNodes = append(filteredNodes, struct {
+			RPC     string  `json:"rpc"`
+			Speed   float64 `json:"speed"`
+			Latency float64 `json:"latency"`
+			Slot    int     `json:"slot"`
+			Diff    int     `json:"diff"`
+			Version string  `json:"version"`
+			Status  string  `json:"status"`
+		}{
+			RPC:     result.RPC,
+			Speed:   result.Speed,
+			Latency: result.Latency,
+			Slot:    result.Slot,
+			Diff:    result.Diff,
+			Version: result.Version,
+			Status:  result.Status,
+		})
 	}
 
 	file, err := os.Create(outputFile)
@@ -437,51 +412,30 @@ func DumpGoodAndSlowNodesToFile(results []struct {
 		return
 	}
 
-	log.Printf("Good and slow nodes saved to %s", outputFile)
+	log.Printf("All nodes saved to %s (Total: %d)", outputFile, len(filteredNodes))
 }
 
-func SelectBestRPC(results []struct {
-	rpc     string
-	speed   float64
-	latency float64
-	slot    int
-	diff    int
-	version string
-	status  string
-}) string {
+func SelectBestRPC(results []NodeEvaluationResult) string {
 	var bestGoodNode struct {
 		rpc   string
 		speed float64
 	}
-	var bestSlowNode struct {
-		rpc   string
-		speed float64
-	}
 
+	// Only consider good nodes - let the retry loop continue with relaxed requirements
 	for _, result := range results {
-		if result.status == "good" && result.speed > bestGoodNode.speed {
+		if result.Status == "good" && result.Speed > bestGoodNode.speed {
 			bestGoodNode = struct {
 				rpc   string
 				speed float64
-			}{rpc: result.rpc, speed: result.speed}
-		}
-		if result.status == "slow" && result.speed > bestSlowNode.speed {
-			bestSlowNode = struct {
-				rpc   string
-				speed float64
-			}{rpc: result.rpc, speed: result.speed}
+			}{rpc: result.RPC, speed: result.Speed}
 		}
 	}
 
-	// Prioritize good nodes; fallback to the fastest slow node if no good nodes are available
+	// Only return good nodes - no fallback to slow nodes
 	if bestGoodNode.rpc != "" {
 		return bestGoodNode.rpc
 	}
-	if bestSlowNode.rpc != "" {
-		log.Printf("No good nodes found. Falling back to the fastest slow node: %s with speed %.2f MB/s", bestSlowNode.rpc, bestSlowNode.speed)
-		return bestSlowNode.rpc
-	}
 
-	log.Println("No suitable RPC nodes found.")
+	// Return empty string to continue retry loop with relaxed requirements
 	return ""
 }

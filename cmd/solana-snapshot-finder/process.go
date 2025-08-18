@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/rpc"
@@ -51,19 +53,70 @@ func processSnapshots(cfg config.Config) {
 		log.Fatal("No RPC nodes available.")
 	}
 
-	// Evaluate nodes
-	results := rpc.EvaluateNodesWithVersions(nodes, cfg, referenceSlot)
-	rpc.SummarizeResultsWithVersions(results)
+	// Evaluate nodes with retry logic and relaxed requirements
+	var results []rpc.NodeEvaluationResult
+	var bestRPC string
+	var outputFile string
 
-	// Save good and slow nodes to file
-	outputFile := filepath.Join(cfg.SnapshotPath, "nodes.json")
-	rpc.DumpGoodAndSlowNodesToFile(results, outputFile)
+	// Try to find suitable nodes with gradually relaxed requirements
+	for attempt := 1; attempt <= cfg.MaxRelaxationAttempts; attempt++ {
+		log.Printf("Evaluating nodes - Attempt %d/%d", attempt, cfg.MaxRelaxationAttempts)
 
-	// Select best RPC
-	bestRPC := rpc.SelectBestRPC(results)
-	if bestRPC == "" {
-		log.Fatal("No suitable RPC found.")
+		if attempt == 1 {
+			// First attempt with original requirements
+			results = rpc.EvaluateNodesWithVersions(nodes, cfg, referenceSlot)
+		} else {
+			// Subsequent attempts with relaxed requirements
+			results = rpc.EvaluateNodesWithRelaxedRequirements(nodes, cfg, referenceSlot, attempt)
+		}
+
+		rpc.SummarizeResultsWithVersions(results)
+
+		// Save good and slow nodes to file
+		outputFile = filepath.Join(cfg.SnapshotPath, fmt.Sprintf("nodes_attempt_%d.json", attempt))
+		rpc.DumpGoodAndSlowNodesToFile(results, outputFile)
+
+		// Try to select best RPC
+		bestRPC = rpc.SelectBestRPC(results)
+		if bestRPC != "" {
+			log.Printf("Found suitable RPC on attempt %d: %s", attempt, bestRPC)
+			break
+		}
+
+		if attempt < cfg.MaxRelaxationAttempts {
+			log.Printf("No suitable RPC found on attempt %d. Relaxing requirements and retrying...", attempt)
+			time.Sleep(time.Duration(cfg.SleepBeforeRetry) * time.Second)
+		}
 	}
+
+	if bestRPC == "" {
+		// After exhausting all relaxation attempts, fall back to the best available node
+		log.Printf("No good nodes found after %d attempts. Falling back to best available node...", cfg.MaxRelaxationAttempts)
+
+		// Use the results from the last attempt to find the best available node
+		var bestAvailableNode struct {
+			rpc   string
+			speed float64
+		}
+
+		for _, result := range results {
+			// Consider both good and slow nodes, prioritize by speed
+			if (result.Status == "good" || result.Status == "slow") && result.Speed > bestAvailableNode.speed {
+				bestAvailableNode = struct {
+					rpc   string
+					speed float64
+				}{rpc: result.RPC, speed: result.Speed}
+			}
+		}
+
+		if bestAvailableNode.rpc != "" {
+			bestRPC = bestAvailableNode.rpc
+			log.Printf("Selected best available node: %s with speed %.2f MB/s", bestRPC, bestAvailableNode.speed)
+		} else {
+			log.Fatal("No suitable RPC found even with relaxed requirements after all attempts.")
+		}
+	}
+
 	log.Printf("Selected RPC: %s", bestRPC)
 
 	// Download genesis snapshot if not present

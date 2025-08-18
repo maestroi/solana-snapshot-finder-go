@@ -11,6 +11,7 @@ Solana Snapshot Finder is a Go utility designed to efficiently manage Solana blo
 - **RPC Node Selection**: Evaluates and selects the best RPC nodes for downloads based on latency and download speed
 - **Automated Cleanup**: Removes outdated snapshots to save disk space while maintaining necessary backups
 - **Full & Incremental Support**: Handles both full and incremental snapshots with proper slot validation
+- **Adaptive Retry Logic**: Gradually relaxes speed and latency requirements on retry attempts to ensure snapshot acquisition
 
 ## Configuration
 
@@ -28,7 +29,23 @@ private_rpc: false                                  # Whether to use private RPC
 worker_count: 100                                   # Number of concurrent evaluation workers
 full_threshold: 25000                               # Slots threshold for full snapshot updates
 incremental_threshold: 1000                         # Slots threshold for incremental updates
+# Retry relaxation parameters
+speed_relaxation_factor: 0.9                        # Factor to reduce speed requirements on retries
+latency_relaxation_factor: 0.9                      # Factor to increase latency tolerance on retries
+max_relaxation_attempts: 3                          # Maximum number of retry attempts with relaxed requirements
 ```
+
+### Retry Relaxation Example
+
+With the default settings above, the relaxation works as follows:
+
+**With `speed_relaxation_factor: 0.8` and `latency_relaxation_factor: 0.8`:**
+- **Attempt 1**: Speed ≥ 100 MB/s, Latency ≤ 200ms (original requirements)
+- **Attempt 2**: Speed ≥ 80 MB/s, Latency ≤ 250ms (relaxed: 100×0.8, 200/0.8)
+- **Attempt 3**: Speed ≥ 64 MB/s, Latency ≤ 313ms (relaxed: 100×0.8×0.8, 200/(0.8×0.8))
+- **Attempt 4**: Speed ≥ 51 MB/s, Latency ≤ 391ms (relaxed: 100×0.8×0.8×0.8, 200/(0.8×0.8×0.8))
+
+*Note: The relaxation factors make requirements more permissive - lower speed thresholds and higher latency tolerance.*
 
 ## How It Works
 
@@ -49,7 +66,14 @@ incremental_threshold: 1000                         # Slots threshold for increm
    - Selects the fastest and most reliable RPC node for downloads
    - Supports blacklisting of problematic nodes
 
-4. **Snapshot Management**:
+5. **Adaptive Retry with Relaxed Requirements**:
+   - If no suitable RPC nodes meet initial speed/latency requirements, automatically retries with relaxed criteria
+   - Gradually reduces minimum download speed requirements on each retry attempt (more permissive)
+   - Progressively increases maximum latency tolerance to find acceptable nodes (more permissive)
+   - Ensures snapshot acquisition even under suboptimal network conditions
+   - Configurable relaxation factors allow fine-tuning of retry behavior
+
+6. **Snapshot Management**:
    - Stores snapshots in organized directories (`snapshot_path` and `snapshot_path/remote`)
    - Maintains temporary and backup files for resilience
    - Cleans up old snapshots based on configurable thresholds
@@ -70,6 +94,11 @@ When integrated with Solana validator startup, the tool will:
 - Employs regex pattern matching to extract slot information from filenames
 - Maintains backup files to prevent data loss during download operations
 - Performs verification at multiple stages to ensure snapshot integrity
+- **Retry Relaxation Algorithm**: 
+  - On each retry attempt, reduces speed requirements by dividing by `speed_relaxation_factor * attempt_number`
+  - Increases latency tolerance by multiplying by `latency_relaxation_factor * attempt_number`
+  - Saves evaluation results for each attempt to `nodes_attempt_N.json` files
+  - Continues until suitable nodes are found or maximum attempts are reached
 
 ## Best Practices
 

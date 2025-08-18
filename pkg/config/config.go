@@ -14,6 +14,10 @@ type Config struct {
 	WorkerCount          int      `mapstructure:"worker_count"`
 	FullThreshold        int      `mapstructure:"full_threshold"` // New: Full snapshot threshold
 	IncrementalThreshold int      `mapstructure:"incremental_threshold"`
+	// Retry relaxation parameters
+	SpeedRelaxationFactor   float64 `mapstructure:"speed_relaxation_factor"`
+	LatencyRelaxationFactor float64 `mapstructure:"latency_relaxation_factor"`
+	MaxRelaxationAttempts   int     `mapstructure:"max_relaxation_attempts"`
 }
 
 func LoadConfig(configPath string) (Config, error) {
@@ -34,6 +38,9 @@ func LoadConfig(configPath string) (Config, error) {
 	viper.SetDefault("worker_count", 100)
 	viper.SetDefault("full_threshold", 25000)
 	viper.SetDefault("incremental_threshold", 1000)
+	viper.SetDefault("speed_relaxation_factor", 0.9)
+	viper.SetDefault("latency_relaxation_factor", 0.9)
+	viper.SetDefault("max_relaxation_attempts", 3)
 
 	// Read the config
 	err := viper.ReadInConfig()
