@@ -7,7 +7,6 @@ type Config struct {
 	SnapshotPath         string   `mapstructure:"snapshot_path"`
 	MinDownloadSpeed     int      `mapstructure:"min_download_speed"`
 	MaxLatency           int      `mapstructure:"max_latency"`
-	NumOfRetries         int      `mapstructure:"num_of_retries"`
 	SleepBeforeRetry     int      `mapstructure:"sleep_before_retry"`
 	Denylist             []string `mapstructure:"denylist"`
 	PrivateRPC           bool     `mapstructure:"private_rpc"`
@@ -18,6 +17,10 @@ type Config struct {
 	SpeedRelaxationFactor   float64 `mapstructure:"speed_relaxation_factor"`
 	LatencyRelaxationFactor float64 `mapstructure:"latency_relaxation_factor"`
 	MaxRelaxationAttempts   int     `mapstructure:"max_relaxation_attempts"`
+	// Retry parameters
+	NumOfRetries int `mapstructure:"num_of_retries"`
+	// Download retry parameters
+	MaxDownloadRetries int `mapstructure:"max_download_retries"`
 }
 
 func LoadConfig(configPath string) (Config, error) {
@@ -41,6 +44,7 @@ func LoadConfig(configPath string) (Config, error) {
 	viper.SetDefault("speed_relaxation_factor", 0.9)
 	viper.SetDefault("latency_relaxation_factor", 0.9)
 	viper.SetDefault("max_relaxation_attempts", 3)
+	viper.SetDefault("max_download_retries", 3)
 
 	// Read the config
 	err := viper.ReadInConfig()

@@ -13,6 +13,7 @@ Solana Snapshot Finder is a Go utility designed to efficiently manage Solana blo
 - **Full & Incremental Support**: Handles both full and incremental snapshots with proper slot validation
 - **Adaptive Retry Logic**: Gradually relaxes speed and latency requirements on retry attempts to ensure snapshot acquisition
 - **Fast RPC Filtering**: Pre-validates snapshot availability with quick HEAD requests before speed testing
+- **Download Retry Logic**: Automatically retries failed downloads with cleanup and fallback
 
 ## Configuration
 
@@ -34,6 +35,7 @@ incremental_threshold: 1000                         # Slots threshold for increm
 speed_relaxation_factor: 0.9                        # Factor to reduce speed requirements on retries
 latency_relaxation_factor: 0.9                      # Factor to increase latency tolerance on retries
 max_relaxation_attempts: 3                          # Maximum number of retry attempts with relaxed requirements
+max_download_retries: 3                             # Maximum number of download retry attempts
 ```
 
 ### Retry Relaxation Example
@@ -71,17 +73,23 @@ With the default settings above, the relaxation works as follows:
 4. **RPC Selection**:
    - Evaluates multiple RPC nodes for performance metrics
    - Selects the fastest and most reliable RPC node for downloads
-   - Supports denylisting of problematic nodes
-   - **Smart Slot Validation**: Prevents downloading from extremely old nodes that could cause sync issues
+   - Applies progressive relaxation on retry attempts
+   - Falls back to best available node if no ideal candidates found
 
-5. **Adaptive Retry with Relaxed Requirements**:
+5. **Download Retry & Recovery**:
+   - **Automatic retries**: Retries failed downloads up to `max_download_retries` times
+   - **Clean retry**: Removes failed partial downloads before retrying
+   - **Fallback support**: Can switch to backup RPCs on download failures
+   - **Resilient operation**: Continues working even after download failures
+
+6. **Adaptive Retry with Relaxed Requirements**:
    - If no suitable RPC nodes meet initial speed/latency requirements, automatically retries with relaxed criteria
    - Gradually reduces minimum download speed requirements on each retry attempt (more permissive)
    - Progressively increases maximum latency tolerance to find acceptable nodes (more permissive)
    - Ensures snapshot acquisition even under suboptimal network conditions
    - Configurable relaxation factors allow fine-tuning of retry behavior
 
-6. **Snapshot Management**:
+7. **Snapshot Management**:
    - Stores snapshots in organized directories (`snapshot_path` and `snapshot_path/remote`)
    - Maintains temporary and backup files for resilience
    - Cleans up old snapshots based on configurable thresholds

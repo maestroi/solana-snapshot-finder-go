@@ -5,12 +5,54 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/rpc"
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/snapshot"
 )
+
+// cleanupFailedDownloads removes failed downloads and temporary files to enable clean retries
+func cleanupFailedDownloads(snapshotPath string) {
+	log.Println("Cleaning up failed downloads...")
+
+	// Clean up tmp directory
+	tmpDir := filepath.Join(snapshotPath, "tmp")
+	if err := os.RemoveAll(tmpDir); err != nil {
+		log.Printf("Warning: Failed to clean tmp directory: %v", err)
+	}
+
+	// Clean up partial downloads in remote directory
+	remoteDir := filepath.Join(snapshotPath, "remote")
+	if err := filepath.Walk(remoteDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip files we can't access
+		}
+
+		// Remove partial downloads (files that might be corrupted)
+		if !info.IsDir() {
+			fileName := info.Name()
+			if strings.HasPrefix(fileName, "tmp-") || strings.HasPrefix(fileName, "backup-") {
+				if err := os.Remove(path); err != nil {
+					log.Printf("Warning: Failed to remove partial file %s: %v", fileName, err)
+				} else {
+					log.Printf("Removed partial file: %s", fileName)
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Printf("Warning: Failed to walk remote directory: %v", err)
+	}
+
+	// Recreate tmp directory
+	if err := os.MkdirAll(tmpDir, os.ModePerm); err != nil {
+		log.Printf("Warning: Failed to recreate tmp directory: %v", err)
+	}
+
+	log.Println("Cleanup completed, ready for retry")
+}
 
 // processSnapshots manages the snapshot download process
 func processSnapshots(cfg config.Config) {
@@ -119,37 +161,75 @@ func processSnapshots(cfg config.Config) {
 
 	log.Printf("Selected RPC: %s", bestRPC)
 
-	// Download genesis snapshot if not present
-	if !snapshot.IsGenesisPresent(cfg.SnapshotPath) {
-		log.Println("Genesis snapshot not found. Downloading from fastest node...")
-		if err := snapshot.DownloadGenesis(bestRPC, cfg.SnapshotPath); err != nil {
-			log.Fatalf("Failed to download genesis snapshot: %v", err)
-		}
-		log.Println("Genesis snapshot downloaded successfully")
+	// Download snapshots with retry logic
+	maxDownloadRetries := cfg.MaxDownloadRetries
+	for downloadAttempt := 1; downloadAttempt <= maxDownloadRetries; downloadAttempt++ {
+		log.Printf("Download attempt %d/%d", downloadAttempt, maxDownloadRetries)
 
-		// Untar the genesis file
-		if err := snapshot.UntarGenesis(cfg.SnapshotPath); err != nil {
-			log.Fatalf("Failed to untar genesis snapshot: %v", err)
-		}
-		log.Println("Genesis snapshot untarred successfully")
-	}
+		// Download genesis snapshot if not present
+		if !snapshot.IsGenesisPresent(cfg.SnapshotPath) {
+			log.Println("Genesis snapshot not found. Downloading from fastest node...")
+			if err := snapshot.DownloadGenesis(bestRPC, cfg.SnapshotPath); err != nil {
+				log.Printf("Failed to download genesis snapshot on attempt %d: %v", downloadAttempt, err)
+				if downloadAttempt < maxDownloadRetries {
+					log.Println("Cleaning up failed download and retrying...")
+					cleanupFailedDownloads(cfg.SnapshotPath)
+					continue
+				} else {
+					log.Fatalf("Failed to download genesis snapshot after %d attempts: %v", maxDownloadRetries, err)
+				}
+			}
+			log.Println("Genesis snapshot downloaded successfully")
 
-	// Download full snapshot if needed
-	if needFull {
-		log.Println("Downloading full snapshot...")
-		if err := snapshot.DownloadSnapshot(bestRPC, cfg, "snapshot-", referenceSlot); err != nil {
-			log.Fatalf("Failed to download full snapshot: %v", err)
+			// Untar the genesis file
+			if err := snapshot.UntarGenesis(cfg.SnapshotPath); err != nil {
+				log.Printf("Failed to untar genesis snapshot on attempt %d: %v", downloadAttempt, err)
+				if downloadAttempt < maxDownloadRetries {
+					log.Println("Cleaning up failed download and retrying...")
+					cleanupFailedDownloads(cfg.SnapshotPath)
+					continue
+				} else {
+					log.Fatalf("Failed to untar genesis snapshot after %d attempts: %v", maxDownloadRetries, err)
+				}
+			}
+			log.Println("Genesis snapshot untarred successfully")
 		}
-		log.Println("Full snapshot downloaded successfully")
-	}
 
-	// Download incremental snapshot if needed
-	if needIncremental {
-		log.Println("Downloading incremental snapshot...")
-		if err := snapshot.DownloadSnapshot(bestRPC, cfg, "incremental-", referenceSlot); err != nil {
-			log.Fatalf("Failed to download incremental snapshot: %v", err)
+		// Download full snapshot if needed
+		if needFull {
+			log.Println("Downloading full snapshot...")
+			if err := snapshot.DownloadSnapshot(bestRPC, cfg, "snapshot-", referenceSlot); err != nil {
+				log.Printf("Failed to download full snapshot on attempt %d: %v", downloadAttempt, err)
+				if downloadAttempt < maxDownloadRetries {
+					log.Println("Cleaning up failed download and retrying...")
+					cleanupFailedDownloads(cfg.SnapshotPath)
+					continue
+				} else {
+					log.Fatalf("Failed to download full snapshot after %d attempts: %v", maxDownloadRetries, err)
+				}
+			}
+			log.Println("Full snapshot downloaded successfully")
 		}
-		log.Println("Incremental snapshot downloaded successfully")
+
+		// Download incremental snapshot if needed
+		if needIncremental {
+			log.Println("Downloading incremental snapshot...")
+			if err := snapshot.DownloadSnapshot(bestRPC, cfg, "incremental-", referenceSlot); err != nil {
+				log.Printf("Failed to download incremental snapshot on attempt %d: %v", downloadAttempt, err)
+				if downloadAttempt < maxDownloadRetries {
+					log.Println("Cleaning up failed download and retrying...")
+					cleanupFailedDownloads(cfg.SnapshotPath)
+					continue
+				} else {
+					log.Fatalf("Failed to download incremental snapshot after %d attempts: %v", maxDownloadRetries, err)
+				}
+			}
+			log.Println("Incremental snapshot downloaded successfully")
+		}
+
+		// If we get here, all downloads succeeded
+		log.Printf("All downloads completed successfully on attempt %d", downloadAttempt)
+		break
 	}
 
 	// Clean up old snapshots
