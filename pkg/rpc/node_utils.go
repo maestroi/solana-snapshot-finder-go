@@ -99,6 +99,8 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	var goodNodes int32
 	var slowNodes int32
 	var badNodes int32
+	var healthFailedNodes int32
+	var snapshotUnavailableNodes int32
 
 	ticker := time.NewTicker(5 * time.Second)
 
@@ -110,8 +112,10 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 				good := atomic.LoadInt32(&goodNodes)
 				slow := atomic.LoadInt32(&slowNodes)
 				bad := atomic.LoadInt32(&badNodes)
-				log.Printf("Progress: %d/%d nodes processed (%.1f%%) | Good: %d, Slow: %d, Bad: %d",
-					processed, len(nodes), float64(processed)/float64(len(nodes))*100, good, slow, bad)
+				healthFailed := atomic.LoadInt32(&healthFailedNodes)
+				snapshotUnavailable := atomic.LoadInt32(&snapshotUnavailableNodes)
+				log.Printf("Progress: %d/%d nodes processed (%.1f%%) | Good: %d, Slow: %d, Bad: %d | Health Failed: %d, No Snapshot: %d",
+					processed, len(nodes), float64(processed)/float64(len(nodes))*100, good, slow, bad, healthFailed, snapshotUnavailable)
 			case <-done:
 				ticker.Stop()
 				return
@@ -157,6 +161,28 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 		return resp.StatusCode == http.StatusOK
 	}
 
+	// NEW: Check if snapshot is actually available before speed testing
+	checkSnapshotAvailability := func(rpc string) bool {
+		client := &http.Client{
+			Timeout: 3 * time.Second, // Quick check for snapshot availability
+		}
+
+		// Try both common snapshot extensions
+		extensions := []string{".tar.bz2", ".tar.zst"}
+		for _, ext := range extensions {
+			snapshotURL := rpc + "/snapshot" + ext
+			resp, err := client.Head(snapshotURL)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				resp.Body.Close()
+				return true
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+		}
+		return false
+	}
+
 	for _, node := range nodes {
 		wg.Add(1)
 		go func(node RPCNode) {
@@ -170,6 +196,15 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			}
 
 			if !checkHealth(rpc) {
+				atomic.AddInt32(&healthFailedNodes, 1)
+				appendResult(node, rpc, 0, 0, 0, 0, "bad")
+				return
+			}
+
+			// NEW: Check if snapshot is actually available before speed testing
+			if !checkSnapshotAvailability(rpc) {
+				atomic.AddInt32(&snapshotUnavailableNodes, 1)
+				log.Printf("Node %s rejected: no snapshot endpoint available", rpc)
 				appendResult(node, rpc, 0, 0, 0, 0, "bad")
 				return
 			}
@@ -249,6 +284,9 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 		atomic.LoadInt32(&goodNodes),
 		atomic.LoadInt32(&slowNodes),
 		atomic.LoadInt32(&badNodes))
+	log.Printf("Filtering breakdown: Health failed: %d, No snapshot endpoint: %d",
+		atomic.LoadInt32(&healthFailedNodes),
+		atomic.LoadInt32(&snapshotUnavailableNodes))
 
 	// Log slot threshold information
 	log.Printf("Node evaluation: using full threshold %d slots for full snapshots (reference slot: %d)",

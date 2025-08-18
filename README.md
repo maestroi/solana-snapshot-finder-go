@@ -12,6 +12,7 @@ Solana Snapshot Finder is a Go utility designed to efficiently manage Solana blo
 - **Automated Cleanup**: Removes outdated snapshots to save disk space while maintaining necessary backups
 - **Full & Incremental Support**: Handles both full and incremental snapshots with proper slot validation
 - **Adaptive Retry Logic**: Gradually relaxes speed and latency requirements on retry attempts to ensure snapshot acquisition
+- **Fast RPC Filtering**: Pre-validates snapshot availability with quick HEAD requests before speed testing
 
 ## Configuration
 
@@ -54,14 +55,20 @@ With the default settings above, the relaxation works as follows:
    - Full snapshots are updated if their slot differs from the reference by more than `full_threshold`
    - Incremental snapshots are updated if they differ by more than `incremental_threshold`
 
-2. **Download Optimization**:
+2. **Fast RPC Filtering**:
+   - **Health Check**: Quick 5-second health check on `/health` endpoint
+   - **Snapshot Pre-Validation**: 3-second HEAD request to verify snapshot availability
+   - **Speed Testing**: Only test RPCs that pass both health and snapshot checks
+   - **Result**: Eliminates RPCs that can't help before wasting time on speed tests
+
+3. **Download Optimization**:
    - Makes a HEAD request to check remote snapshot details before downloading
    - Extracts the filename and slot information from response headers
    - Skips downloads if the remote snapshot is not newer than the local snapshot
    - Downloads to a temporary file first, then copies to final location
    - Maintains a backup during the process for safety
 
-3. **RPC Selection**:
+4. **RPC Selection**:
    - Evaluates multiple RPC nodes for performance metrics
    - Selects the fastest and most reliable RPC node for downloads
    - Supports denylisting of problematic nodes
