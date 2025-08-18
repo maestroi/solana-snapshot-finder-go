@@ -9,7 +9,7 @@ type Config struct {
 	MaxLatency           int      `mapstructure:"max_latency"`
 	NumOfRetries         int      `mapstructure:"num_of_retries"`
 	SleepBeforeRetry     int      `mapstructure:"sleep_before_retry"`
-	Blacklist            []string `mapstructure:"blacklist"`
+	Denylist             []string `mapstructure:"denylist"`
 	PrivateRPC           bool     `mapstructure:"private_rpc"`
 	WorkerCount          int      `mapstructure:"worker_count"`
 	FullThreshold        int      `mapstructure:"full_threshold"` // New: Full snapshot threshold
@@ -33,7 +33,7 @@ func LoadConfig(configPath string) (Config, error) {
 	viper.SetDefault("max_latency", 200)
 	viper.SetDefault("num_of_retries", 3)
 	viper.SetDefault("sleep_before_retry", 5)
-	viper.SetDefault("blacklist", []string{})
+	viper.SetDefault("denylist", []string{})
 	viper.SetDefault("private_rpc", false)
 	viper.SetDefault("worker_count", 100)
 	viper.SetDefault("full_threshold", 25000)

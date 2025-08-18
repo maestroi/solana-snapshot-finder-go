@@ -24,7 +24,7 @@ min_download_speed: 100                             # Minimum acceptable downloa
 max_latency: 200                                    # Maximum acceptable latency (ms)
 num_of_retries: 3                                   # Number of download retry attempts
 sleep_before_retry: 5                               # Time between retries (seconds)
-blacklist: []                                       # RPC nodes to exclude
+denylist: []                                       # RPC nodes to exclude
 private_rpc: false                                  # Whether to use private RPCs
 worker_count: 100                                   # Number of concurrent evaluation workers
 full_threshold: 25000                               # Slots threshold for full snapshot updates
@@ -64,7 +64,7 @@ With the default settings above, the relaxation works as follows:
 3. **RPC Selection**:
    - Evaluates multiple RPC nodes for performance metrics
    - Selects the fastest and most reliable RPC node for downloads
-   - Supports blacklisting of problematic nodes
+   - Supports denylisting of problematic nodes
 
 5. **Adaptive Retry with Relaxed Requirements**:
    - If no suitable RPC nodes meet initial speed/latency requirements, automatically retries with relaxed criteria

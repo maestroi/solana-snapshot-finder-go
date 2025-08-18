@@ -11,6 +11,6 @@ incremental_threshold: 500
 speed_relaxation_factor: 0.9
 latency_relaxation_factor: 0.9
 max_relaxation_attempts: 3
-blacklist:
+denylist:
   - "192.168.1.100"
   - "10.0.0.5"

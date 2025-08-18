@@ -22,7 +22,12 @@ type RPCNode struct {
 	Version string
 }
 
-func GetRPCNodes(rpcAddress string, retries int, blacklist []string, privateRPC bool) ([]RPCNode, []string, error) {
+func GetRPCNodes(rpcAddress string, retries int, denylist []string, privateRPC bool) ([]RPCNode, []string, error) {
+	// Log denylist configuration if any IPs are specified
+	if len(denylist) > 0 {
+		log.Printf("Denylist configured with %d IPs: %v", len(denylist), denylist)
+	}
+
 	payload := []byte(`{"jsonrpc":"2.0", "id":1, "method":"getClusterNodes"}`)
 	req, err := http.NewRequest("POST", rpcAddress, bytes.NewBuffer(payload))
 	if err != nil {
@@ -67,16 +72,17 @@ func GetRPCNodes(rpcAddress string, retries int, blacklist []string, privateRPC 
 		if node.RPC != "" {
 			rpcIP := strings.Split(node.RPC, ":")[0]
 
-			// Check if the IP is blacklisted
-			isBlacklisted := false
-			for _, blocked := range blacklist {
+			// Check if the IP is denied
+			isDenied := false
+			for _, blocked := range denylist {
 				if rpcIP == blocked {
-					isBlacklisted = true
+					isDenied = true
+					log.Printf("Node %s denied by config (IP %s is in denylist)", node.RPC, rpcIP)
 					break
 				}
 			}
 
-			if !isBlacklisted {
+			if !isDenied {
 				nodes = append(nodes, RPCNode{
 					Address: node.RPC,
 					Version: node.Version,
@@ -90,16 +96,17 @@ func GetRPCNodes(rpcAddress string, retries int, blacklist []string, privateRPC 
 			gossipIP := strings.Split(node.Gossip, ":")[0] // Extract gossip IP
 			privateRPCAddress := fmt.Sprintf("%s:8899", gossipIP)
 
-			// Check if the IP is blacklisted
-			isBlacklisted := false
-			for _, blocked := range blacklist {
+			// Check if the IP is denied
+			isDenied := false
+			for _, blocked := range denylist {
 				if gossipIP == blocked {
-					isBlacklisted = true
+					isDenied = true
+					log.Printf("Private node %s denied by config (IP %s is in denylist)", privateRPCAddress, gossipIP)
 					break
 				}
 			}
 
-			if !isBlacklisted {
+			if !isDenied {
 				nodes = append(nodes, RPCNode{
 					Address: privateRPCAddress,
 					Version: node.Version,
@@ -108,6 +115,12 @@ func GetRPCNodes(rpcAddress string, retries int, blacklist []string, privateRPC 
 			}
 		}
 	}
+
+	// Log summary of denylist filtering
+	if len(denylist) > 0 {
+		log.Printf("Denylist filtering complete: %d nodes available, %d nodes denied by config", len(nodes), len(result.Result)-len(nodes))
+	}
+
 	return nodes, addresses, nil
 }
 
@@ -160,7 +173,7 @@ func FetchRPCNodes(cfg config.Config) []RPCNode {
 	var err error
 
 	for attempt := 1; attempt <= cfg.NumOfRetries; attempt++ {
-		nodes, _, err = GetRPCNodes(cfg.RPCAddress, cfg.NumOfRetries, cfg.Blacklist, cfg.PrivateRPC)
+		nodes, _, err = GetRPCNodes(cfg.RPCAddress, cfg.NumOfRetries, cfg.Denylist, cfg.PrivateRPC)
 		if err == nil && len(nodes) > 0 {
 			log.Printf("Fetched %d RPC nodes on attempt %d.", len(nodes), attempt)
 			return nodes
