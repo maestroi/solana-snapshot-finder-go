@@ -224,7 +224,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 				return
 			}
 
-			slot, err := GetReferenceSlot(rpc)
+			slot, err := GetHighestSnapshotSlot(rpc)
 			if err != nil {
 				appendResult(node, rpc, speed, latency, 0, 0, "slow")
 				return
