@@ -179,54 +179,6 @@ func GetReferenceSlot(rpcAddress string) (int, error) {
 	return result.Result, nil
 }
 
-// GetHighestSnapshotSlot calls the getHighestSnapshotSlot RPC method to get the highest available snapshot slot
-func GetHighestSnapshotSlot(rpcAddress string) (int, error) {
-	payload := map[string]interface{}{
-		"id":      1,
-		"jsonrpc": "2.0",
-		"method":  "getHighestSnapshotSlot",
-		"params":  []interface{}{},
-	}
-	body, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest("POST", rpcAddress, bytes.NewBuffer(body))
-	if err != nil {
-		return 0, fmt.Errorf("failed to create request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("failed to fetch highest snapshot slot: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	respBody, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return 0, fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	var result struct {
-		JSONRPC string `json:"jsonrpc"`
-		Result  struct {
-			Full        int `json:"full"`
-			Incremental int `json:"incremental"`
-		} `json:"result"`
-		ID int `json:"id"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return 0, fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	// Return the full snapshot slot
-	return result.Result.Full, nil
-}
-
 // FetchRPCNodes fetches RPC nodes
 func FetchRPCNodes(cfg config.Config) []RPCNode {
 	var nodes []RPCNode
