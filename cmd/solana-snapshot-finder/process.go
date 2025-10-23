@@ -73,12 +73,22 @@ func processSnapshots(cfg config.Config) {
 		log.Fatalf("Failed to create remote directory: %v", err)
 	}
 
-	// Get reference slot from RPC
-	referenceSlot, err := rpc.GetReferenceSlot(cfg.RPCAddress)
-	if err != nil {
-		log.Fatalf("Failed to get reference slot: %v", err)
+	// Get highest snapshot slots from RPC
+	var referenceSlot int
+	if slots, err := rpc.GetHighestSnapshotSlots(cfg.RPCAddress); err == nil {
+		// Use the incremental slot as reference since it's typically higher
+		referenceSlot = slots.Incremental
+		log.Printf("Snapshot slots - Full: %d, Incremental: %d (using incremental: %d as reference)",
+			slots.Full, slots.Incremental, referenceSlot)
+	} else {
+		log.Printf("Failed to get highest snapshot slots, falling back to getSlot: %v", err)
+		// Fallback to the original getSlot method if getHighestSnapshotSlots fails
+		referenceSlot, err = rpc.GetReferenceSlot(cfg.RPCAddress)
+		if err != nil {
+			log.Fatalf("Failed to get reference slot: %v", err)
+		}
+		log.Printf("Reference slot (fallback): %d", referenceSlot)
 	}
-	log.Printf("Reference slot: %d", referenceSlot)
 
 	// Check if we need new snapshots
 	needFull, needIncremental := snapshot.ManageSnapshots(cfg, referenceSlot)

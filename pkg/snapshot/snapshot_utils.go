@@ -223,6 +223,12 @@ func ManageSnapshots(cfg config.Config, referenceSlot int) (bool, bool) {
 		incrementalSnapshot.FileName, incrementalSnapshot.SlotStart, incrementalSnapshot.SlotEnd,
 		incrementalDiff, cfg.IncrementalThreshold)
 
+	// Additional logging for debugging
+	if incrementalDiff < 0 {
+		log.Printf("Note: Incremental snapshot is newer than reference slot (incremental: %d > reference: %d)",
+			incrementalSnapshot.SlotEnd, referenceSlot)
+	}
+
 	if incrementalDiff > cfg.IncrementalThreshold {
 		log.Printf("Incremental snapshot is outdated. Diff (%d) exceeds threshold (%d)",
 			incrementalDiff, cfg.IncrementalThreshold)

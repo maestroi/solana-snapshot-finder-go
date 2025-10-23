@@ -19,13 +19,15 @@ import (
 
 // NodeEvaluationResult represents the result of evaluating an RPC node
 type NodeEvaluationResult struct {
-	RPC     string  `json:"rpc"`
-	Speed   float64 `json:"speed"`
-	Latency float64 `json:"latency"`
-	Slot    int     `json:"slot"`
-	Diff    int     `json:"diff"`
-	Version string  `json:"version"`
-	Status  string  `json:"status"`
+	RPC             string  `json:"rpc"`
+	Speed           float64 `json:"speed"`
+	Latency         float64 `json:"latency"`
+	Slot            int     `json:"slot"`
+	FullSlot        int     `json:"full_slot"`
+	IncrementalSlot int     `json:"incremental_slot"`
+	Diff            int     `json:"diff"`
+	Version         string  `json:"version"`
+	Status          string  `json:"status"`
 }
 
 func MeasureSpeed(url string, measureTime int) (float64, float64, error) {
@@ -123,15 +125,17 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 		}
 	}()
 
-	appendResult := func(node RPCNode, rpc string, speed, latency float64, slot, diff int, status string) {
+	appendResult := func(node RPCNode, rpc string, speed, latency float64, slot, fullSlot, incrementalSlot, diff int, status string) {
 		results <- NodeEvaluationResult{
-			RPC:     rpc,
-			Speed:   speed,
-			Latency: latency,
-			Slot:    slot,
-			Diff:    diff,
-			Version: node.Version,
-			Status:  status,
+			RPC:             rpc,
+			Speed:           speed,
+			Latency:         latency,
+			Slot:            slot,
+			FullSlot:        fullSlot,
+			IncrementalSlot: incrementalSlot,
+			Diff:            diff,
+			Version:         node.Version,
+			Status:          status,
 		}
 
 		processed := atomic.AddInt32(&processedNodes, 1)
@@ -197,7 +201,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 
 			if !checkHealth(rpc) {
 				atomic.AddInt32(&healthFailedNodes, 1)
-				appendResult(node, rpc, 0, 0, 0, 0, "bad")
+				appendResult(node, rpc, 0, 0, 0, 0, 0, 0, "bad")
 				return
 			}
 
@@ -205,13 +209,13 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			if !checkSnapshotAvailability(rpc) {
 				atomic.AddInt32(&snapshotUnavailableNodes, 1)
 				log.Printf("Node %s rejected: no snapshot endpoint available", rpc)
-				appendResult(node, rpc, 0, 0, 0, 0, "bad")
+				appendResult(node, rpc, 0, 0, 0, 0, 0, 0, "bad")
 				return
 			}
 
 			baseURL, err := url.Parse(rpc)
 			if err != nil {
-				appendResult(node, rpc, 0, 0, 0, 0, "bad")
+				appendResult(node, rpc, 0, 0, 0, 0, 0, 0, "bad")
 				return
 			}
 
@@ -220,14 +224,25 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 
 			speed, latency, err := MeasureSpeed(snapshotURL, cfg.SleepBeforeRetry/2)
 			if err != nil {
-				appendResult(node, rpc, speed, latency, 0, 0, "slow")
+				appendResult(node, rpc, speed, latency, 0, 0, 0, 0, "slow")
 				return
 			}
 
-			slot, err := GetReferenceSlot(rpc)
-			if err != nil {
-				appendResult(node, rpc, speed, latency, 0, 0, "slow")
-				return
+			// Try to get highest snapshot slots first, fallback to regular slot
+			var slot, fullSlot, incrementalSlot int
+			if slots, err := GetHighestSnapshotSlots(rpc); err == nil {
+				fullSlot = slots.Full
+				incrementalSlot = slots.Incremental
+				slot = fullSlot // Use full slot as the reference
+			} else {
+				log.Printf("Node %s: getHighestSnapshotSlots failed, trying getSlot: %v", rpc, err)
+				slot, err = GetReferenceSlot(rpc)
+				if err != nil {
+					appendResult(node, rpc, speed, latency, 0, 0, 0, 0, "slow")
+					return
+				}
+				fullSlot = slot
+				incrementalSlot = slot
 			}
 
 			diff := defaultSlot - slot
@@ -245,7 +260,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			// We want full snapshots as close as possible to current slot height
 			if diff > slotThreshold {
 				log.Printf("Node %s rejected: slot too old (diff: %d, max allowed: %d)", rpc, diff, slotThreshold)
-				appendResult(node, rpc, speed, latency, slot, diff, "bad")
+				appendResult(node, rpc, speed, latency, slot, fullSlot, incrementalSlot, diff, "bad")
 				return
 			}
 
@@ -257,7 +272,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			}
 			// Otherwise keep as "slow" for nodes that are functional but don't meet requirements
 
-			appendResult(node, rpc, speed, latency, slot, diff, status)
+			appendResult(node, rpc, speed, latency, slot, fullSlot, incrementalSlot, diff, status)
 		}(node)
 	}
 
@@ -349,41 +364,47 @@ func summarizeResultsWithVersions(results []NodeEvaluationResult) {
 	log.Println("List of good nodes:")
 	for _, result := range results {
 		if result.Status == "good" {
-			log.Printf("Node: %s | Speed: %.2f MB/s | Latency: %.2f ms | Slot: %d | Diff: %d | Version: %s",
-				result.RPC, result.Speed, result.Latency, result.Slot, result.Diff, result.Version)
+			log.Printf("Node: %s | Speed: %.2f MB/s | Latency: %.2f ms | Slot: %d | Full: %d | Incremental: %d | Diff: %d | Version: %s",
+				result.RPC, result.Speed, result.Latency, result.Slot, result.FullSlot, result.IncrementalSlot, result.Diff, result.Version)
 		}
 	}
 }
 
 func dumpGoodAndSlowNodesToFile(results []NodeEvaluationResult, outputFile string) {
 	var filteredNodes []struct {
-		RPC     string  `json:"rpc"`
-		Speed   float64 `json:"speed"`
-		Latency float64 `json:"latency"`
-		Slot    int     `json:"slot"`
-		Diff    int     `json:"diff"`
-		Version string  `json:"version"`
-		Status  string  `json:"status"`
+		RPC             string  `json:"rpc"`
+		Speed           float64 `json:"speed"`
+		Latency         float64 `json:"latency"`
+		Slot            int     `json:"slot"`
+		FullSlot        int     `json:"full_slot"`
+		IncrementalSlot int     `json:"incremental_slot"`
+		Diff            int     `json:"diff"`
+		Version         string  `json:"version"`
+		Status          string  `json:"status"`
 	}
 
 	// Save all nodes regardless of status to help with debugging
 	for _, result := range results {
 		filteredNodes = append(filteredNodes, struct {
-			RPC     string  `json:"rpc"`
-			Speed   float64 `json:"speed"`
-			Latency float64 `json:"latency"`
-			Slot    int     `json:"slot"`
-			Diff    int     `json:"diff"`
-			Version string  `json:"version"`
-			Status  string  `json:"status"`
+			RPC             string  `json:"rpc"`
+			Speed           float64 `json:"speed"`
+			Latency         float64 `json:"latency"`
+			Slot            int     `json:"slot"`
+			FullSlot        int     `json:"full_slot"`
+			IncrementalSlot int     `json:"incremental_slot"`
+			Diff            int     `json:"diff"`
+			Version         string  `json:"version"`
+			Status          string  `json:"status"`
 		}{
-			RPC:     result.RPC,
-			Speed:   result.Speed,
-			Latency: result.Latency,
-			Slot:    result.Slot,
-			Diff:    result.Diff,
-			Version: result.Version,
-			Status:  result.Status,
+			RPC:             result.RPC,
+			Speed:           result.Speed,
+			Latency:         result.Latency,
+			Slot:            result.Slot,
+			FullSlot:        result.FullSlot,
+			IncrementalSlot: result.IncrementalSlot,
+			Diff:            result.Diff,
+			Version:         result.Version,
+			Status:          result.Status,
 		})
 	}
 
@@ -427,41 +448,47 @@ func SummarizeResultsWithVersions(results []NodeEvaluationResult) {
 	log.Println("List of good nodes:")
 	for _, result := range results {
 		if result.Status == "good" {
-			log.Printf("Node: %s | Speed: %.2f MB/s | Latency: %.2f ms | Slot: %d | Diff: %d | Version: %s",
-				result.RPC, result.Speed, result.Latency, result.Slot, result.Diff, result.Version)
+			log.Printf("Node: %s | Speed: %.2f MB/s | Latency: %.2f ms | Slot: %d | Full: %d | Incremental: %d | Diff: %d | Version: %s",
+				result.RPC, result.Speed, result.Latency, result.Slot, result.FullSlot, result.IncrementalSlot, result.Diff, result.Version)
 		}
 	}
 }
 
 func DumpGoodAndSlowNodesToFile(results []NodeEvaluationResult, outputFile string) {
 	var filteredNodes []struct {
-		RPC     string  `json:"rpc"`
-		Speed   float64 `json:"speed"`
-		Latency float64 `json:"latency"`
-		Slot    int     `json:"slot"`
-		Diff    int     `json:"diff"`
-		Version string  `json:"version"`
-		Status  string  `json:"status"`
+		RPC             string  `json:"rpc"`
+		Speed           float64 `json:"speed"`
+		Latency         float64 `json:"latency"`
+		Slot            int     `json:"slot"`
+		FullSlot        int     `json:"full_slot"`
+		IncrementalSlot int     `json:"incremental_slot"`
+		Diff            int     `json:"diff"`
+		Version         string  `json:"version"`
+		Status          string  `json:"status"`
 	}
 
 	// Save all nodes regardless of status to help with debugging
 	for _, result := range results {
 		filteredNodes = append(filteredNodes, struct {
-			RPC     string  `json:"rpc"`
-			Speed   float64 `json:"speed"`
-			Latency float64 `json:"latency"`
-			Slot    int     `json:"slot"`
-			Diff    int     `json:"diff"`
-			Version string  `json:"version"`
-			Status  string  `json:"status"`
+			RPC             string  `json:"rpc"`
+			Speed           float64 `json:"speed"`
+			Latency         float64 `json:"latency"`
+			Slot            int     `json:"slot"`
+			FullSlot        int     `json:"full_slot"`
+			IncrementalSlot int     `json:"incremental_slot"`
+			Diff            int     `json:"diff"`
+			Version         string  `json:"version"`
+			Status          string  `json:"status"`
 		}{
-			RPC:     result.RPC,
-			Speed:   result.Speed,
-			Latency: result.Latency,
-			Slot:    result.Slot,
-			Diff:    result.Diff,
-			Version: result.Version,
-			Status:  result.Status,
+			RPC:             result.RPC,
+			Speed:           result.Speed,
+			Latency:         result.Latency,
+			Slot:            result.Slot,
+			FullSlot:        result.FullSlot,
+			IncrementalSlot: result.IncrementalSlot,
+			Diff:            result.Diff,
+			Version:         result.Version,
+			Status:          result.Status,
 		})
 	}
 
