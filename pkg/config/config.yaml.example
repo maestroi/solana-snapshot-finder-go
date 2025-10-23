@@ -6,7 +6,7 @@ num_of_retries: 5
 sleep_before_retry: 5
 private_rpc: false
 worker_count: 100
-full_threshold: 25000
+full_threshold: 100000
 incremental_threshold: 500
 speed_relaxation_factor: 0.9
 latency_relaxation_factor: 0.9
