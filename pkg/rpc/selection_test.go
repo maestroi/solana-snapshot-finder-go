@@ -50,6 +50,27 @@ func TestParseRetryAfterHTTPDate(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfterClampsExcessiveDelay(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Retry-After", "3600")
+
+	got, ok := ParseRetryAfter(headers, time.Now())
+	if !ok || got != maxRetryAfter {
+		t.Fatalf("ParseRetryAfter() = %v, %v; want %v, true", got, ok, maxRetryAfter)
+	}
+}
+
+func TestParseRetryAfterClampsExcessiveHTTPDate(t *testing.T) {
+	now := time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+	headers := http.Header{}
+	headers.Set("Retry-After", now.Add(2*time.Hour).Format(http.TimeFormat))
+
+	got, ok := ParseRetryAfter(headers, now)
+	if !ok || got != maxRetryAfter {
+		t.Fatalf("ParseRetryAfter() = %v, %v; want %v, true", got, ok, maxRetryAfter)
+	}
+}
+
 func TestParseRetryAfterRejectsDeltaSecondsOverflow(t *testing.T) {
 	headers := http.Header{}
 	headers.Set("Retry-After", "9223372036854775807")

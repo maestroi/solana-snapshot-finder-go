@@ -2,11 +2,18 @@ package rpc
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// maxRetryAfter caps how long we'll honor a server-supplied Retry-After value.
+// Servers can send arbitrarily large delays (deliberately or by mistake); an
+// unbounded sleep would stall the whole download loop, so anything longer
+// than this is clamped.
+const maxRetryAfter = 60 * time.Second
 
 type HostCooldown struct {
 	Excluded   map[string]string
@@ -79,11 +86,19 @@ func ParseRetryAfter(headers http.Header, now time.Time) (time.Duration, bool) {
 		if seconds > maxDurationSeconds {
 			return 0, false
 		}
-		return time.Duration(seconds) * time.Second, true
+		return clampRetryAfter(time.Duration(seconds) * time.Second), true
 	}
 	retryAt, err := http.ParseTime(value)
 	if err != nil || !retryAt.After(now) {
 		return 0, false
 	}
-	return retryAt.Sub(now), true
+	return clampRetryAfter(retryAt.Sub(now)), true
+}
+
+func clampRetryAfter(d time.Duration) time.Duration {
+	if d > maxRetryAfter {
+		log.Printf("Retry-After value %s exceeds cap %s; clamping", d, maxRetryAfter)
+		return maxRetryAfter
+	}
+	return d
 }
