@@ -488,35 +488,62 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	return evaluatedResults
 }
 
-// EvaluateNodesWithRelaxedRequirements evaluates nodes with gradually relaxed requirements on each retry
-func EvaluateNodesWithRelaxedRequirements(nodes []RPCNode, cfg config.Config, defaultSlot int, attempt int) []NodeEvaluationResult {
-	// Calculate relaxed requirements based on attempt number
+// RelaxedConfigForAttempt returns cfg with speed and latency requirements
+// relaxed cumulatively for the requested attempt. Slot requirements stay strict.
+func RelaxedConfigForAttempt(cfg config.Config, attempt int) config.Config {
 	relaxedSpeed := float64(cfg.MinDownloadSpeed)
 	relaxedLatency := float64(cfg.MaxLatency)
-	// Slot threshold remains strict - we don't want to relax this requirement
-	// as it could lead to downloading outdated snapshots
 
-	// Callers only invoke this for attempt > 1 (attempt 1 uses EvaluateNodesWithVersions directly).
-	if attempt > 1 {
-		// Apply relaxation factor for each attempt beyond the first
-		// Each attempt multiplies the previous relaxation
-		for i := 1; i < attempt; i++ {
-			relaxedSpeed = relaxedSpeed * cfg.SpeedRelaxationFactor
-			relaxedLatency = relaxedLatency / cfg.LatencyRelaxationFactor
-			// Slot threshold stays the same - no relaxation
-		}
-
-		log.Printf("Attempt %d: Relaxed requirements - Speed: %.2f MB/s (from %d), Latency: %.2f ms (from %d), Slot threshold: %d (strict, no relaxation)",
-			attempt, relaxedSpeed, cfg.MinDownloadSpeed, relaxedLatency, cfg.MaxLatency, cfg.FullThreshold)
+	for i := 1; i < attempt; i++ {
+		relaxedSpeed *= cfg.SpeedRelaxationFactor
+		relaxedLatency /= cfg.LatencyRelaxationFactor
 	}
 
-	// Create a temporary config with relaxed requirements for this evaluation
 	relaxedConfig := cfg
 	relaxedConfig.MinDownloadSpeed = int(relaxedSpeed)
 	relaxedConfig.MaxLatency = int(relaxedLatency)
-	// Keep original slot threshold - no relaxation
+	if attempt > 1 {
+		log.Printf("Attempt %d: Relaxed requirements - Speed: %.2f MB/s (from %d), Latency: %.2f ms (from %d), Slot threshold: %d (strict, no relaxation)",
+			attempt, relaxedSpeed, cfg.MinDownloadSpeed, relaxedLatency, cfg.MaxLatency, cfg.FullThreshold)
+	}
+	return relaxedConfig
+}
 
-	return EvaluateNodesWithVersions(nodes, relaxedConfig, defaultSlot)
+// ReclassifyResults applies speed and latency requirements to measurements
+// already collected by EvaluateNodesWithVersions. It performs no network I/O.
+func ReclassifyResults(results []NodeEvaluationResult, cfg config.Config, _ int) []NodeEvaluationResult {
+	reclassified := make([]NodeEvaluationResult, len(results))
+	copy(reclassified, results)
+
+	slotThreshold := cfg.FullThreshold
+	if slotThreshold == 0 {
+		slotThreshold = 100000
+	}
+
+	for i := range reclassified {
+		result := &reclassified[i]
+		if result.Status == "bad" {
+			continue
+		}
+
+		slotOK := result.Diff <= slotThreshold
+		if cfg.MaxSlot > 0 {
+			slotOK = result.FullSlot > 0 && int64(result.FullSlot) <= cfg.MaxSlot
+		}
+
+		switch {
+		case result.Speed >= float64(cfg.MinDownloadSpeed) &&
+			result.Latency <= float64(cfg.MaxLatency) &&
+			slotOK:
+			result.Status = "good"
+		case result.Speed == 0 || result.Latency == 0:
+			result.Status = "bad"
+		default:
+			result.Status = "slow"
+		}
+	}
+
+	return reclassified
 }
 
 func SummarizeResultsWithVersions(results []NodeEvaluationResult) {

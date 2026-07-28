@@ -156,16 +156,15 @@ func processSnapshots(cfg config.Config) {
 	var bestRPC string
 	var outputFile string
 
-	// Try to find suitable nodes with gradually relaxed requirements
+	// Probe and speed-test once, then only re-score the stored measurements as
+	// speed and latency requirements are relaxed.
+	results = rpc.EvaluateNodesWithVersions(nodes, cfg, referenceSlot)
 	for attempt := 1; attempt <= cfg.MaxRelaxationAttempts; attempt++ {
 		log.Printf("Evaluating nodes - Attempt %d/%d", attempt, cfg.MaxRelaxationAttempts)
 
-		if attempt == 1 {
-			// First attempt with original requirements
-			results = rpc.EvaluateNodesWithVersions(nodes, cfg, referenceSlot)
-		} else {
-			// Subsequent attempts with relaxed requirements
-			results = rpc.EvaluateNodesWithRelaxedRequirements(nodes, cfg, referenceSlot, attempt)
+		if attempt > 1 {
+			attemptCfg := rpc.RelaxedConfigForAttempt(cfg, attempt)
+			results = rpc.ReclassifyResults(results, attemptCfg, referenceSlot)
 		}
 
 		rpc.SummarizeResultsWithVersions(results)

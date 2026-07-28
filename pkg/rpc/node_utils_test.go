@@ -276,65 +276,70 @@ func TestFilterResultsByMaxSlot(t *testing.T) {
 	}
 }
 
-func TestRelaxationFactors(t *testing.T) {
-	cfg := config.Config{
-		MinDownloadSpeed:        100,
-		MaxLatency:              200,
-		SpeedRelaxationFactor:   0.8,
-		LatencyRelaxationFactor: 0.8,
-		MaxRelaxationAttempts:   3,
+func TestReclassifyResultsPromotesSlowToGood(t *testing.T) {
+	results := []NodeEvaluationResult{
+		{RPC: "http://a", Speed: 60, Latency: 180, Diff: 10, Status: "slow"},
+		{RPC: "http://b", Speed: 10, Latency: 500, Diff: 10, Status: "slow"},
+		{RPC: "http://c", Speed: 0, Latency: 0, Diff: 10, Status: "bad"},
 	}
+	cfg := config.Config{MinDownloadSpeed: 50, MaxLatency: 200, FullThreshold: 100000}
 
-	// Test that relaxation factors are applied correctly
-	relaxedConfig := cfg
-	relaxedConfig.MinDownloadSpeed = int(float64(cfg.MinDownloadSpeed) * (cfg.SpeedRelaxationFactor * 1))
-	relaxedConfig.MaxLatency = int(float64(cfg.MaxLatency) / (cfg.LatencyRelaxationFactor * 1))
+	out := ReclassifyResults(results, cfg, 1_000_000)
 
-	// Speed should be reduced: 100 * 0.8 = 80
-	expectedSpeed := 80
-	if relaxedConfig.MinDownloadSpeed != expectedSpeed {
-		t.Errorf("Expected relaxed speed %d, got %d", expectedSpeed, relaxedConfig.MinDownloadSpeed)
+	var good, slow, bad int
+	for _, r := range out {
+		switch r.Status {
+		case "good":
+			good++
+		case "slow":
+			slow++
+		case "bad":
+			bad++
+		}
 	}
-
-	// Latency should be increased: 200 / 0.8 = 250
-	expectedLatency := 250
-	if relaxedConfig.MaxLatency != expectedLatency {
-		t.Errorf("Expected relaxed latency %d, got %d", expectedLatency, relaxedConfig.MaxLatency)
+	if good != 1 || slow != 1 || bad != 1 {
+		t.Fatalf("good=%d slow=%d bad=%d want 1/1/1", good, slow, bad)
 	}
 }
 
-func TestRelaxationCalculation(t *testing.T) {
+func TestReclassifyResultsDoesNotPromoteBadOrRelaxSlotRules(t *testing.T) {
+	results := []NodeEvaluationResult{
+		{RPC: "bad", Speed: 100, Latency: 10, Slot: 999_990, FullSlot: 999_990, Diff: 10, Status: "bad"},
+		{RPC: "stale", Speed: 100, Latency: 10, Slot: 800_000, FullSlot: 800_000, Diff: 200_000, Status: "slow"},
+	}
+	cfg := config.Config{MinDownloadSpeed: 50, MaxLatency: 200, FullThreshold: 100_000}
+
+	out := ReclassifyResults(results, cfg, 1_000_000)
+
+	if out[0].Status != "bad" {
+		t.Fatalf("bad node promoted to %q", out[0].Status)
+	}
+	if out[1].Status != "slow" {
+		t.Fatalf("stale node reclassified as %q", out[1].Status)
+	}
+}
+
+func TestRelaxedConfigForAttemptAppliesCumulativeFactors(t *testing.T) {
 	cfg := config.Config{
 		MinDownloadSpeed:        100,
 		MaxLatency:              200,
 		SpeedRelaxationFactor:   0.8,
 		LatencyRelaxationFactor: 0.8,
-		MaxRelaxationAttempts:   3,
+		FullThreshold:           1234,
 	}
 
-	// Test relaxation calculation logic
-	relaxedSpeed := float64(cfg.MinDownloadSpeed)
-	relaxedLatency := float64(cfg.MaxLatency)
+	got := RelaxedConfigForAttempt(cfg, 3)
 
-	// Simulate attempt 2
-	attempt := 2
-	if attempt > 1 && attempt <= cfg.MaxRelaxationAttempts {
-		// Each attempt multiplies the previous relaxation
-		for i := 1; i < attempt; i++ {
-			relaxedSpeed = relaxedSpeed * cfg.SpeedRelaxationFactor
-			relaxedLatency = relaxedLatency / cfg.LatencyRelaxationFactor
-		}
+	if got.MinDownloadSpeed != 64 {
+		t.Errorf("MinDownloadSpeed=%d want 64", got.MinDownloadSpeed)
 	}
-
-	// Speed should be: 100 * 0.8 = 80
-	expectedSpeed := 100.0 * 0.8
-	if relaxedSpeed != expectedSpeed {
-		t.Errorf("Expected relaxed speed %.2f, got %.2f", expectedSpeed, relaxedSpeed)
+	if got.MaxLatency != 312 {
+		t.Errorf("MaxLatency=%d want 312", got.MaxLatency)
 	}
-
-	// Latency should be: 200 / 0.8 = 250
-	expectedLatency := 200.0 / 0.8
-	if relaxedLatency != expectedLatency {
-		t.Errorf("Expected relaxed latency %.2f, got %.2f", expectedLatency, relaxedLatency)
+	if got.FullThreshold != cfg.FullThreshold {
+		t.Errorf("FullThreshold=%d want unchanged %d", got.FullThreshold, cfg.FullThreshold)
+	}
+	if cfg.MinDownloadSpeed != 100 || cfg.MaxLatency != 200 {
+		t.Fatalf("input config mutated: speed=%d latency=%d", cfg.MinDownloadSpeed, cfg.MaxLatency)
 	}
 }
