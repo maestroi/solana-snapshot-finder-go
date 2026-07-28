@@ -151,6 +151,13 @@ func processSnapshots(cfg config.Config) {
 		log.Fatal("No RPC nodes available.")
 	}
 
+	if warm := rpc.LoadWarmStartRPCs(cfg.SnapshotPath, cfg.WarmStartMinNodes); len(warm) > 0 {
+		log.Printf("Warm-start: prioritizing %d cached good/slow nodes", len(warm))
+		nodes = rpc.PrioritizeNodes(nodes, warm)
+	} else {
+		log.Printf("Warm-start: skipped (need >= %d good/slow in nodes_attempt_*.json)", cfg.WarmStartMinNodes)
+	}
+
 	// Evaluate nodes with retry logic and relaxed requirements
 	var results []rpc.NodeEvaluationResult
 	var bestRPC string
