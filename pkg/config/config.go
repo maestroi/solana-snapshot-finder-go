@@ -16,6 +16,9 @@ type Config struct {
 	FullThreshold        int      `mapstructure:"full_threshold"`
 	IncrementalThreshold int      `mapstructure:"incremental_threshold"`
 	SpeedTestCandidates  int      `mapstructure:"speed_test_candidates"`
+	SpeedTestWorkers     int      `mapstructure:"speed_test_workers"`
+	SpeedTestMaxBytes    int64    `mapstructure:"speed_test_max_bytes"`
+	WarmStartMinNodes    int      `mapstructure:"warm_start_min_nodes"`
 	// Retry relaxation parameters
 	SpeedRelaxationFactor   float64 `mapstructure:"speed_relaxation_factor"`
 	LatencyRelaxationFactor float64 `mapstructure:"latency_relaxation_factor"`
@@ -59,6 +62,9 @@ func LoadConfig(configPath string) (Config, error) {
 	viper.SetDefault("full_threshold", 100000) // Agave 3.x: ~100k slots after full
 	viper.SetDefault("incremental_threshold", 1000)
 	viper.SetDefault("speed_test_candidates", 30)
+	viper.SetDefault("speed_test_workers", 5)
+	viper.SetDefault("speed_test_max_bytes", int64(268435456))
+	viper.SetDefault("warm_start_min_nodes", 3)
 	viper.SetDefault("speed_relaxation_factor", 0.9)
 	viper.SetDefault("latency_relaxation_factor", 0.9)
 	viper.SetDefault("max_relaxation_attempts", 3)
