@@ -8,6 +8,7 @@ type Config struct {
 	MinDownloadSpeed     int      `mapstructure:"min_download_speed"`
 	MaxLatency           int      `mapstructure:"max_latency"`
 	SleepBeforeRetry     int      `mapstructure:"sleep_before_retry"`
+	SpeedTestSeconds     int      `mapstructure:"speed_test_seconds"`
 	Denylist             []string `mapstructure:"denylist"`
 	PrivateRPC           bool     `mapstructure:"private_rpc"`
 	WorkerCount          int      `mapstructure:"worker_count"`
@@ -36,6 +37,7 @@ func LoadConfig(configPath string) (Config, error) {
 	viper.SetDefault("max_latency", 200)
 	viper.SetDefault("num_of_retries", 3)
 	viper.SetDefault("sleep_before_retry", 5)
+	viper.SetDefault("speed_test_seconds", 3)
 	viper.SetDefault("denylist", []string{})
 	viper.SetDefault("private_rpc", false)
 	viper.SetDefault("worker_count", 100)

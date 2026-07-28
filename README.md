@@ -26,6 +26,7 @@ min_download_speed: 100                             # Minimum acceptable downloa
 max_latency: 200                                    # Maximum acceptable latency (ms)
 num_of_retries: 3                                   # Number of download retry attempts
 sleep_before_retry: 5                               # Time between retries (seconds)
+speed_test_seconds: 3                               # Duration of the download speed test per node (seconds)
 denylist: []                                       # RPC nodes to exclude
 private_rpc: false                                  # Whether to use private RPCs
 worker_count: 100                                   # Number of concurrent evaluation workers
@@ -64,11 +65,16 @@ With the default settings above, the relaxation works as follows:
    - **Result**: Eliminates RPCs that can't help before wasting time on speed tests
 
 3. **Download Optimization**:
-   - Makes a HEAD request to check remote snapshot details before downloading
-   - Extracts the filename and slot information from response headers
-   - Skips downloads if the remote snapshot is not newer than the local snapshot
+   - Downloads directly with a single GET per extension attempt - no separate HEAD
+     pre-check, since the node was already probed during evaluation and an extra
+     request right before the real download risks tripping the node's own rate
+     limiter (429) at the worst possible time
+   - Extracts the filename and slot information from the redirect-resolved URL
+   - For full snapshots, discards the download if it turns out not to be newer
+     than the local snapshot
+   - Rejects downloads under 1MB as likely error/redirect responses rather than
+     real snapshot data
    - Downloads to a temporary file first, then copies to final location
-   - Maintains a backup during the process for safety
 
 4. **RPC Selection**:
    - Evaluates multiple RPC nodes for performance metrics
@@ -79,7 +85,8 @@ With the default settings above, the relaxation works as follows:
 5. **Download Retry & Recovery**:
    - **Automatic retries**: Retries failed downloads up to `max_download_retries` times
    - **Clean retry**: Removes failed partial downloads before retrying
-   - **Fallback support**: Can switch to backup RPCs on download failures
+   - **Node rotation**: Switches to the next-best evaluated RPC node on failure instead
+     of retrying the same node
    - **Resilient operation**: Continues working even after download failures
 
 6. **Adaptive Retry with Relaxed Requirements**:

@@ -165,8 +165,10 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 		return resp.StatusCode == http.StatusOK
 	}
 
-	// NEW: Check if snapshot is actually available before speed testing
-	checkSnapshotAvailability := func(rpc string) bool {
+	// NEW: Check if snapshot is actually available before speed testing.
+	// Returns the extension that responded so the speed test hits the same
+	// URL that was just confirmed available, instead of assuming .tar.bz2.
+	checkSnapshotAvailability := func(rpc string) (bool, string) {
 		client := &http.Client{
 			Timeout: 3 * time.Second, // Quick check for snapshot availability
 		}
@@ -178,13 +180,13 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			resp, err := client.Head(snapshotURL)
 			if err == nil && resp.StatusCode == http.StatusOK {
 				resp.Body.Close()
-				return true
+				return true, ext
 			}
 			if resp != nil {
 				resp.Body.Close()
 			}
 		}
-		return false
+		return false, ""
 	}
 
 	for _, node := range nodes {
@@ -206,7 +208,8 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			}
 
 			// NEW: Check if snapshot is actually available before speed testing
-			if !checkSnapshotAvailability(rpc) {
+			available, ext := checkSnapshotAvailability(rpc)
+			if !available {
 				atomic.AddInt32(&snapshotUnavailableNodes, 1)
 				log.Printf("Node %s rejected: no snapshot endpoint available", rpc)
 				appendResult(node, rpc, 0, 0, 0, 0, 0, 0, "bad")
@@ -219,10 +222,10 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 				return
 			}
 
-			baseURL.Path = "/snapshot.tar.bz2"
+			baseURL.Path = "/snapshot" + ext
 			snapshotURL := baseURL.String()
 
-			speed, latency, err := MeasureSpeed(snapshotURL, cfg.SleepBeforeRetry/2)
+			speed, latency, err := MeasureSpeed(snapshotURL, cfg.SpeedTestSeconds)
 			if err != nil {
 				appendResult(node, rpc, speed, latency, 0, 0, 0, 0, "slow")
 				return
@@ -319,7 +322,8 @@ func EvaluateNodesWithRelaxedRequirements(nodes []RPCNode, cfg config.Config, de
 	// Slot threshold remains strict - we don't want to relax this requirement
 	// as it could lead to downloading outdated snapshots
 
-	if attempt > 1 && attempt <= cfg.MaxRelaxationAttempts {
+	// Callers only invoke this for attempt > 1 (attempt 1 uses EvaluateNodesWithVersions directly).
+	if attempt > 1 {
 		// Apply relaxation factor for each attempt beyond the first
 		// Each attempt multiplies the previous relaxation
 		for i := 1; i < attempt; i++ {
@@ -339,90 +343,6 @@ func EvaluateNodesWithRelaxedRequirements(nodes []RPCNode, cfg config.Config, de
 	// Keep original slot threshold - no relaxation
 
 	return EvaluateNodesWithVersions(nodes, relaxedConfig, defaultSlot)
-}
-
-func summarizeResultsWithVersions(results []NodeEvaluationResult) {
-	totalNodes := len(results)
-	goodNodes := 0
-	slowNodes := 0
-	badNodes := 0
-
-	for _, result := range results {
-		switch result.Status {
-		case "good":
-			goodNodes++
-		case "slow":
-			slowNodes++
-		case "bad":
-			badNodes++
-		}
-	}
-
-	log.Printf("Node evaluation complete. Total nodes: %d | Good: %d | Slow: %d | Bad: %d",
-		totalNodes, goodNodes, slowNodes, badNodes)
-
-	log.Println("List of good nodes:")
-	for _, result := range results {
-		if result.Status == "good" {
-			log.Printf("Node: %s | Speed: %.2f MB/s | Latency: %.2f ms | Slot: %d | Full: %d | Incremental: %d | Diff: %d | Version: %s",
-				result.RPC, result.Speed, result.Latency, result.Slot, result.FullSlot, result.IncrementalSlot, result.Diff, result.Version)
-		}
-	}
-}
-
-func dumpGoodAndSlowNodesToFile(results []NodeEvaluationResult, outputFile string) {
-	var filteredNodes []struct {
-		RPC             string  `json:"rpc"`
-		Speed           float64 `json:"speed"`
-		Latency         float64 `json:"latency"`
-		Slot            int     `json:"slot"`
-		FullSlot        int     `json:"full_slot"`
-		IncrementalSlot int     `json:"incremental_slot"`
-		Diff            int     `json:"diff"`
-		Version         string  `json:"version"`
-		Status          string  `json:"status"`
-	}
-
-	// Save all nodes regardless of status to help with debugging
-	for _, result := range results {
-		filteredNodes = append(filteredNodes, struct {
-			RPC             string  `json:"rpc"`
-			Speed           float64 `json:"speed"`
-			Latency         float64 `json:"latency"`
-			Slot            int     `json:"slot"`
-			FullSlot        int     `json:"full_slot"`
-			IncrementalSlot int     `json:"incremental_slot"`
-			Diff            int     `json:"diff"`
-			Version         string  `json:"version"`
-			Status          string  `json:"status"`
-		}{
-			RPC:             result.RPC,
-			Speed:           result.Speed,
-			Latency:         result.Latency,
-			Slot:            result.Slot,
-			FullSlot:        result.FullSlot,
-			IncrementalSlot: result.IncrementalSlot,
-			Diff:            result.Diff,
-			Version:         result.Version,
-			Status:          result.Status,
-		})
-	}
-
-	file, err := os.Create(outputFile)
-	if err != nil {
-		log.Printf("Error creating output file: %v", err)
-		return
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(filteredNodes); err != nil {
-		log.Printf("Error writing to JSON file: %v", err)
-		return
-	}
-
-	log.Printf("All nodes saved to %s (Total: %d)", outputFile, len(filteredNodes))
 }
 
 func SummarizeResultsWithVersions(results []NodeEvaluationResult) {

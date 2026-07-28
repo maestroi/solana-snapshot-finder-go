@@ -11,6 +11,8 @@ config.local.yaml
 
 # Scripts
 run.sh
+deploy.sh
+dist/
 
 # Snapshot directories
 snapshots/
