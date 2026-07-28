@@ -11,6 +11,15 @@ import (
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 )
 
+func TestSpeedTestWorkerClamp(t *testing.T) {
+	if got := speedTestWorkerCount(config.Config{SpeedTestWorkers: 0}); got != 5 {
+		t.Errorf("got %d want 5", got)
+	}
+	if got := speedTestWorkerCount(config.Config{SpeedTestWorkers: 3}); got != 3 {
+		t.Errorf("got %d want 3", got)
+	}
+}
+
 func TestMeasureSpeedStopsAtByteCap(t *testing.T) {
 	var readBytes atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

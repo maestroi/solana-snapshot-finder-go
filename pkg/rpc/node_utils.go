@@ -259,6 +259,13 @@ type probeCandidate struct {
 	latency float64
 }
 
+func speedTestWorkerCount(cfg config.Config) int {
+	if cfg.SpeedTestWorkers <= 0 {
+		return 5
+	}
+	return cfg.SpeedTestWorkers
+}
+
 // EvaluateNodesWithVersions evaluates cluster nodes in two phases: a cheap
 // health+availability+latency probe against every node, then a real
 // bandwidth speed test against only the closest cfg.SpeedTestCandidates of
@@ -329,6 +336,8 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	}
 
 	// Phase B: real bandwidth speed test, only against the shortlisted candidates.
+	log.Printf("Phase B: speed-testing %d candidates with %d workers", len(candidates), speedTestWorkerCount(cfg))
+	speedSem := make(chan struct{}, speedTestWorkerCount(cfg))
 	results := make(chan NodeEvaluationResult, len(candidates))
 	var goodNodes, slowNodes, badNodes int32
 
@@ -341,8 +350,8 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 		wg.Add(1)
 		go func(c probeCandidate) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+			speedSem <- struct{}{}
+			defer func() { <-speedSem }()
 
 			snapshotURL := normalizeRPCBase(c.rpc) + "/snapshot" + c.ext
 			if _, err := url.Parse(snapshotURL); err != nil {
