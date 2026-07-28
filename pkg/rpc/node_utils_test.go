@@ -38,6 +38,23 @@ func TestCheckSnapshotAvailabilityReturnsSlotFromRedirect(t *testing.T) {
 	}
 }
 
+func TestCheckSnapshotAvailabilityPreservesRedirectSlotWithGenericContentDisposition(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/snapshot.tar.bz2" {
+			http.Redirect(w, r, "/snapshot-123-AbCdEf.tar.zst", http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="snapshot.tar.zst"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	available, ext, fullSlot := checkSnapshotAvailability(srv.URL)
+	if !available || ext != ".tar.bz2" || fullSlot != 123 {
+		t.Fatalf("got available=%v ext=%q fullSlot=%d", available, ext, fullSlot)
+	}
+}
+
 func TestEvaluateNodesUsesHeadFullSlotAndRPCIncrementalSlot(t *testing.T) {
 	var snapshotSlotCalls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

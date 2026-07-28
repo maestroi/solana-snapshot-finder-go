@@ -255,11 +255,12 @@ func checkSnapshotAvailability(rpc string) (bool, string, int) {
 		snapshotURL := base + "/snapshot" + ext
 		resp, err := client.Head(snapshotURL)
 		if err == nil && resp.StatusCode == http.StatusOK {
-			fileName := filepath.Base(resp.Request.URL.Path)
+			fullSlot, _ := parseFullSnapshotSlotFromName(filepath.Base(resp.Request.URL.Path))
 			if _, params, parseErr := mime.ParseMediaType(resp.Header.Get("Content-Disposition")); parseErr == nil && params["filename"] != "" {
-				fileName = filepath.Base(params["filename"])
+				if dispositionSlot, ok := parseFullSnapshotSlotFromName(filepath.Base(params["filename"])); ok {
+					fullSlot = dispositionSlot
+				}
 			}
-			fullSlot, _ := parseFullSnapshotSlotFromName(fileName)
 			resp.Body.Close()
 			return true, ext, fullSlot
 		}
