@@ -2,7 +2,7 @@
 
 Date: 2026-07-28  
 Branch context: `perf/reduce-node-probe-load`  
-Status: Revised after code review — pending re-approval for planning
+Status: Revised after second consistency pass — pending re-approval for planning
 
 ## Goals
 
@@ -43,7 +43,7 @@ These are the non-incremental parts of the design — treat them as real tasks i
 
 - Relaxation retries do not re-run health/HEAD/speed tests (criterion #1 above)
 - Speed tests use the replaced MeasureSpeed (time + byte cap + Range fallback) under a separate `speed_test_workers` semaphore
-- Full-slot parsing from HEAD redirect is best-effort only; incremental never depends on HEAD for slots
+- Full-slot parsing from HEAD redirect is best-effort only during evaluation; **evaluation** never uses incremental HEAD for slots (see Incremental slot sources)
 - Rate-limited / failing hosts are excluded via the extended `selectNextRPC` cooldown set for the rest of the run
 - Full downloads keep existing slot checks; **incremental mismatch with local full base slot fails and rotates** (behavior change #5)
 - Warm-start only activates when the reused `nodes_attempt_*.json` cache has ≥ `warm_start_min_nodes` good/slow peers
@@ -66,8 +66,8 @@ Shortlist by latency → speed_test_candidates
 Phase B: speed test
         │  NEW separate speed_test_workers semaphore (not worker_count)
         │  REPLACED MeasureSpeed: timed + max bytes, Range then fallback GET
-        │  full slot from HEAD filename if present, else RPC
-        │  incremental slots via getHighestSnapshotSlots only
+        │  full slot: HEAD filename wins if present (no RPC reconcile); else RPC
+        │  IncrementalSlot (evaluation): getHighestSnapshotSlots only — never HEAD
         ▼
 Classify good / slow / bad  (ONCE per run)
         │
@@ -75,12 +75,23 @@ Classify good / slow / bad  (ONCE per run)
         ▼
 Select best RPC → download (preserve: no pre-download HEAD)
         │  extend selectNextRPC exclude set with 429/cooldown + Retry-After
+        │  post-selection: FindMatchingIncremental / ProbeIncrementalInfo may still
+        │  HEAD incremental endpoints (separate from evaluation; see below)
         ▼
 Filename / slot sanity check
         │  incremental base≠full: FAIL + remove + rotate (stricter than today)
         ▼
 Retention cleanup
 ```
+
+### Incremental slot sources (two paths — do not conflate)
+
+| Path | When | Slot source | HEAD `/incremental-snapshot`? |
+|------|------|-------------|-------------------------------|
+| **Evaluation (Phase A/B)** | Classifying nodes before download | `getHighestSnapshotSlots` only for `IncrementalSlot` | **Never.** Mass incremental HEAD is unreliable and out of scope for evaluation. |
+| **Post-selection matching** | After a full slot is chosen — safety incremental via existing `FindMatchingIncremental` → `ProbeIncrementalInfo` | Filename slots from that targeted probe | **Allowed to remain.** This is a separate parallel path that matches one artifact to a known full slot; it is not evaluation “slot discovery.” If HEAD fails, matching fails as today (skip safety incremental with warning). |
+
+Implementers must not “fold” `ProbeIncrementalInfo` into Phase A/B, remove it, or reinterpret the evaluation rule as banning this post-selection matcher. Evaluation rule and matcher path are intentionally different.
 
 ## Evaluation pipeline
 
@@ -90,7 +101,7 @@ Retention cleanup
 - HEAD `/snapshot` (+ extensions) for availability + latency
 - Opportunistic full-slot parse from redirect / Content-Disposition filename when present
 - On HTTP 429 during probe: mark host in the in-run cooldown/exclude set
-- Incremental snapshot HEAD is not used for slot discovery (known unreliable on many nodes)
+- Do **not** HEAD incremental endpoints during Phase A (evaluation rule above)
 - Concurrency: existing `worker_count` semaphore (unchanged role: Phase A only after the split)
 
 ### Warm-start (priority only)
@@ -113,9 +124,17 @@ Retention cleanup
   - If Range is rejected (or unsupported status), fall back to a normal GET with the same stop rules
   - Stop when **either** `speed_test_seconds` elapses **or** `speed_test_max_bytes` is reached
   - Compute MB/s from bytes / elapsed so ~500 MB/s links still get a meaningful sample
-- Full slot: reuse HEAD-derived slot when available; otherwise `getHighestSnapshotSlots` / `getSlot`
-- Incremental slot: always from `getHighestSnapshotSlots` (matching incremental probe path must not rely on HEAD for correctness)
+- **Full slot tie-break:** if Phase A already derived a slot from the full-snapshot HEAD/redirect filename, **HEAD wins** — do not call RPC to reconcile, and do not cross-check against `getHighestSnapshotSlots`. Rationale: the download follows the same HTTP redirect, so the HEAD filename is the artifact that will be served; RPC metadata can disagree and is less relevant for what we pull. If no HEAD-derived slot exists, fall back to `getHighestSnapshotSlots` / `getSlot` as today.
+- **IncrementalSlot (evaluation only):** always from `getHighestSnapshotSlots`. Never from incremental HEAD during Phase B. Post-selection `ProbeIncrementalInfo` is unchanged and separate (see table above).
 - Slot threshold (`full_threshold`) stays strict — never relaxed
+
+### `speed_test_max_bytes` vs peer-load goal
+
+Default **256 MiB** is an intentional accuracy/load tradeoff, not an unbounded pull:
+
+- **Vs today:** current `MeasureSpeed` has **no byte cap**. A 3s GET on a ~500 MB/s link already transfers ~1.5 GiB per candidate. Capping at 256 MiB **reduces** bytes pulled from fast peers versus status quo while still giving a usable sample at high throughput.
+- **Primary load wins** in this design still come from (1) shortlisting to `speed_test_candidates` and (2) not re-running Phase A/B on relaxation — not from the byte cap alone.
+- **Worst-case math:** up to `speed_test_candidates` × `speed_test_max_bytes` (e.g. 30 × 256 MiB ≈ 7.5 GiB) if every shortlisted node is fast enough to hit the cap. That is acceptable relative to today’s uncapped timed GETs on the same shortlist, but the default is a **tunable** — measure production impact and lower `speed_test_max_bytes` or `speed_test_candidates` if operators still see excess probe bandwidth.
 
 ### Relaxation retries
 
@@ -141,7 +160,7 @@ Retention cleanup
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `speed_test_workers` | `5` | **New** Phase B semaphore bound (separate from `worker_count`) |
-| `speed_test_max_bytes` | `268435456` (256 MiB) | **New** byte cap inside replaced `MeasureSpeed` |
+| `speed_test_max_bytes` | `268435456` (256 MiB) | **New** byte cap inside replaced `MeasureSpeed` (see load rationale above; tunable after measurement) |
 | `speed_test_seconds` | existing | Max duration of a speed test |
 | `speed_test_candidates` | `30` | Latency shortlist size (already exists) |
 | `warm_start_min_nodes` | `3` | Minimum cached good/slow nodes before warm-start activates |
@@ -152,20 +171,23 @@ Existing relaxation, threshold, whitelist, and download-retry knobs remain uncha
 ## Logging
 
 - Clear phase lines: probe → shortlist → speed-test → select → download
-- Log whether full slot came from HEAD filename vs RPC
+- Log whether full slot came from HEAD filename vs RPC (and that HEAD won without RPC reconcile when applicable)
 - Log when Range speed-test fell back to non-Range GET
 - Log when warm-start was skipped due to fewer than `warm_start_min_nodes` entries
 - Log when an incremental is rejected for base-slot mismatch (new hard-fail path)
+- Log cooldown/exclude events with reason (`429`, timeout, download failure) and any observed `Retry-After` value (seconds or HTTP-date as received) before sleeping/skipping
 
 ## Testing
 
 - Unit: relaxation re-scores without calling into probe/speed-test paths
-- Unit: parse full snapshot slot from filename; incremental path does not require HEAD for slots
+- Unit: evaluation incremental slots do not require HEAD; post-selection `ProbeIncrementalInfo` remains a separate callable path
+- Unit: HEAD-derived full slot is used without requiring an RPC cross-check
 - Unit: replaced MeasureSpeed stops on time **or** byte cap; Range rejection falls back cleanly
 - Unit: Phase B uses `speed_test_workers` bound (not `worker_count`) — at least a structural/regression assertion around the split gates if practical
 - Unit: cooldown/exclude set skips host in `selectNextRPC`-style selection
+- Unit: when a response carries `Retry-After`, the retry path waits at least that duration before the next download attempt
 - Unit: warm-start ignored when cached good/slow nodes &lt; `warm_start_min_nodes`; loads from `nodes_attempt_*.json` format
-- Unit: incremental base≠full returns error and does not leave the mismatched file as success
+- Unit: **behavior change** — incremental base≠full returns error, removes the mismatched file, and does not treat the download as success (regression vs today’s warn-and-keep)
 - Existing evaluation/download tests remain green
 
 ## Docs
