@@ -2,7 +2,6 @@ package snapshot
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -169,30 +168,6 @@ func IsGenesisPresent(snapshotPath string) bool {
 	return false
 }
 
-// Helper function to copy a file
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("failed to open source file: %v", err)
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to create destination file: %v", err)
-	}
-	defer destFile.Close()
-
-	if _, err = io.Copy(destFile, sourceFile); err != nil {
-		return fmt.Errorf("failed to copy file contents: %v", err)
-	}
-
-	if err = destFile.Sync(); err != nil {
-		return fmt.Errorf("failed to sync destination file: %v", err)
-	}
-
-	return nil
-}
 
 func ManageSnapshots(cfg config.Config, referenceSlot int) (bool, bool) {
 	log.Println("Checking snapshots...")

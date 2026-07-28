@@ -54,6 +54,33 @@ func cleanupFailedDownloads(snapshotPath string) {
 	log.Println("Cleanup completed, ready for retry")
 }
 
+// selectNextRPC returns the fastest "good" node not in the excluded set, falling back to "slow".
+func selectNextRPC(results []rpc.NodeEvaluationResult, exclude map[string]bool) string {
+	best := ""
+	bestSpeed := 0.0
+	for _, r := range results {
+		if exclude[r.RPC] {
+			continue
+		}
+		if r.Status == "good" && r.Speed > bestSpeed {
+			best, bestSpeed = r.RPC, r.Speed
+		}
+	}
+	if best != "" {
+		return best
+	}
+	// fallback: slow nodes
+	for _, r := range results {
+		if exclude[r.RPC] {
+			continue
+		}
+		if r.Status == "slow" && r.Speed > bestSpeed {
+			best, bestSpeed = r.RPC, r.Speed
+		}
+	}
+	return best
+}
+
 // processSnapshots manages the snapshot download process
 func processSnapshots(cfg config.Config) {
 	// Create snapshot directory if it doesn't exist
@@ -173,6 +200,7 @@ func processSnapshots(cfg config.Config) {
 
 	// Download snapshots with retry logic
 	maxDownloadRetries := cfg.MaxDownloadRetries
+	failedNodes := make(map[string]bool)
 	for downloadAttempt := 1; downloadAttempt <= maxDownloadRetries; downloadAttempt++ {
 		log.Printf("Download attempt %d/%d", downloadAttempt, maxDownloadRetries)
 
@@ -211,6 +239,11 @@ func processSnapshots(cfg config.Config) {
 			if err := snapshot.DownloadSnapshot(bestRPC, cfg, "snapshot-", referenceSlot); err != nil {
 				log.Printf("Failed to download full snapshot on attempt %d: %v", downloadAttempt, err)
 				if downloadAttempt < maxDownloadRetries {
+					failedNodes[bestRPC] = true
+					if next := selectNextRPC(results, failedNodes); next != "" {
+						log.Printf("Switching from %s to %s", bestRPC, next)
+						bestRPC = next
+					}
 					log.Println("Cleaning up failed download and retrying...")
 					cleanupFailedDownloads(cfg.SnapshotPath)
 					continue
@@ -227,6 +260,11 @@ func processSnapshots(cfg config.Config) {
 			if err := snapshot.DownloadSnapshot(bestRPC, cfg, "incremental-", referenceSlot); err != nil {
 				log.Printf("Failed to download incremental snapshot on attempt %d: %v", downloadAttempt, err)
 				if downloadAttempt < maxDownloadRetries {
+					failedNodes[bestRPC] = true
+					if next := selectNextRPC(results, failedNodes); next != "" {
+						log.Printf("Switching from %s to %s", bestRPC, next)
+						bestRPC = next
+					}
 					log.Println("Cleaning up failed download and retrying...")
 					cleanupFailedDownloads(cfg.SnapshotPath)
 					continue

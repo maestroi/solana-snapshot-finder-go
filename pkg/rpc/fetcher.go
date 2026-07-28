@@ -179,54 +179,6 @@ func GetReferenceSlot(rpcAddress string) (int, error) {
 	return result.Result, nil
 }
 
-// GetHighestSnapshotSlot fetches the highest available snapshot slot from the RPC node
-func GetHighestSnapshotSlot(rpcAddress string) (int, error) {
-	payload := map[string]interface{}{
-		"id":      1,
-		"jsonrpc": "2.0",
-		"method":  "getHighestSnapshotSlot",
-		"params":  []interface{}{},
-	}
-	body, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest("POST", rpcAddress, bytes.NewBuffer(body))
-	if err != nil {
-		return 0, fmt.Errorf("failed to create request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("failed to fetch highest snapshot slot: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	respBody, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return 0, fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	var result struct {
-		JSONRPC string `json:"jsonrpc"`
-		Result  struct {
-			Full        int `json:"full"`
-			Incremental int `json:"incremental"`
-		} `json:"result"`
-		ID int `json:"id"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return 0, fmt.Errorf("failed to parse response: %v", err)
-	}
-
-	// Return the full snapshot slot as it represents the highest complete snapshot
-	return result.Result.Full, nil
-}
-
 // SnapshotSlots represents the response from getHighestSnapshotSlot
 type SnapshotSlots struct {
 	Full        int `json:"full"`
@@ -300,51 +252,4 @@ func FetchRPCNodes(cfg config.Config) []RPCNode {
 	}
 
 	return nil // Should not reach here
-}
-
-// Selects the best RPC from the evaluated nodes
-func selectBestRPC(results []struct {
-	rpc     string
-	speed   float64
-	latency float64
-	slot    int
-	diff    int
-	version string
-	status  string
-}) string {
-	var bestGoodNode struct {
-		rpc   string
-		speed float64
-	}
-	var bestSlowNode struct {
-		rpc   string
-		speed float64
-	}
-
-	for _, result := range results {
-		if result.status == "good" && result.speed > bestGoodNode.speed {
-			bestGoodNode = struct {
-				rpc   string
-				speed float64
-			}{rpc: result.rpc, speed: result.speed}
-		}
-		if result.status == "slow" && result.speed > bestSlowNode.speed {
-			bestSlowNode = struct {
-				rpc   string
-				speed float64
-			}{rpc: result.rpc, speed: result.speed}
-		}
-	}
-
-	// Prioritize good nodes; fallback to the fastest slow node if no good nodes are available
-	if bestGoodNode.rpc != "" {
-		return bestGoodNode.rpc
-	}
-	if bestSlowNode.rpc != "" {
-		log.Printf("No good nodes found. Falling back to the fastest slow node: %s with speed %.2f MB/s", bestSlowNode.rpc, bestSlowNode.speed)
-		return bestSlowNode.rpc
-	}
-
-	log.Println("No suitable RPC nodes found.")
-	return ""
 }

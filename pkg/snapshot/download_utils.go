@@ -81,6 +81,10 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, fmt.Errorf("snapshot request returned status %d for %s", resp.StatusCode, snapshotURL)
+	}
+
 	// Get the final URL after redirects
 	finalURL := resp.Request.URL.String()
 	fileName := filepath.Base(finalURL)
@@ -139,6 +143,13 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 	tmpFile.Close()
 	log.Printf("Download completed to temporary file. Size: %d bytes", totalBytes)
 
+	// ponytail: 1MB floor — any real Solana snapshot is hundreds of MB
+	const minSnapshotBytes = 1 << 20
+	if totalBytes < minSnapshotBytes {
+		os.Remove(tmpFilePath)
+		return "", 0, fmt.Errorf("downloaded file is too small (%d bytes), likely an error response", totalBytes)
+	}
+
 	// Copy from temporary to final location
 	srcFile, err := os.Open(tmpFilePath)
 	if err != nil {
@@ -168,25 +179,10 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 		log.Printf("Warning: Failed to sync file to disk: %v", err)
 	}
 
-	// Keep the temporary file as backup
-	backupPath := filepath.Join(tmpDir, "backup-"+fileName)
-	if err := os.Rename(tmpFilePath, backupPath); err != nil {
-		log.Printf("Warning: Failed to rename temporary file to backup: %v", err)
-	} else {
-		log.Printf("Kept backup file at: %s", backupPath)
-	}
+	os.Remove(tmpFilePath)
 
 	// Verify the final file exists
 	if _, err := os.Stat(finalFilePath); err != nil {
-		// If final file doesn't exist but we have a backup, try to restore from backup
-		if _, backupErr := os.Stat(backupPath); backupErr == nil {
-			log.Printf("Final file missing, attempting to restore from backup")
-			if err := copyFile(backupPath, finalFilePath); err != nil {
-				log.Printf("Failed to restore from backup: %v", err)
-			} else {
-				log.Printf("Successfully restored from backup")
-			}
-		}
 		return "", 0, fmt.Errorf("final file does not exist after copy: %v", err)
 	}
 	log.Printf("Verified final file exists: %s", finalFilePath)
@@ -229,8 +225,12 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 	// Try both .tar.bz2 and .tar.zst extensions
 	var finalPath string
 	var sizeBytes int64
-	var downloadErr error
+	downloadErr := fmt.Errorf("no extension returned HTTP 200 from %s", rpcAddress)
 
+	// NOTE: no HEAD pre-check here. The node was already probed (health, snapshot
+	// availability, speed) during evaluation, so an extra HEAD right before the
+	// real download just doubles our request rate against the same IP and risks
+	// tripping the node's own rate limiter (429) right when we need it most.
 	extensions := []string{".tar.bz2", ".tar.zst"}
 	for _, ext := range extensions {
 		var snapshotURL string
@@ -241,63 +241,32 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 		}
 		log.Printf("Trying URL: %s", snapshotURL)
 
-		// Make a HEAD request first to get information about the snapshot
-		client := &http.Client{
-			Timeout: 10 * time.Second,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return nil // Allow redirects
-			},
-		}
-		resp, err := client.Head(snapshotURL)
-		if err != nil {
-			log.Printf("HEAD request failed for %s: %v", snapshotURL, err)
+		finalPath, sizeBytes, downloadErr = writeSnapshotToFile(snapshotURL, tmpDir, cfg.SnapshotPath, false)
+		if downloadErr != nil {
+			log.Printf("Failed to download with %s extension: %v", ext, downloadErr)
 			continue
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("HEAD request returned status %d for %s", resp.StatusCode, snapshotURL)
-			resp.Body.Close()
-			continue
-		}
-
-		// Try to get filename from the Content-Disposition header or final URL
-		fileName := filepath.Base(resp.Request.URL.String())
-		if contentDisposition := resp.Header.Get("Content-Disposition"); contentDisposition != "" {
-			parts := strings.Split(contentDisposition, "filename=")
-			if len(parts) > 1 {
-				fileName = strings.Trim(parts[1], `"' `)
-				log.Printf("Filename from Content-Disposition: %s", fileName)
-			}
-		}
-		log.Printf("Remote snapshot filename: %s", fileName)
-		resp.Body.Close()
-
-		// Extract slot from the filename
-		var remoteSlot int
+		// For full snapshots, only now do we know the real slot (from the downloaded
+		// file's name) - if it's not newer than what we already have, discard it.
 		if strings.HasPrefix(snapshotType, "snapshot-") {
-			var err error
-			remoteSlot, err = ExtractFullSnapshotSlot(fileName)
+			remoteSlot, err := ExtractFullSnapshotSlot(filepath.Base(finalPath))
 			if err != nil {
-				log.Printf("Warning: Could not extract slot from filename %s: %v", fileName, err)
+				log.Printf("Warning: downloaded file doesn't match full snapshot naming: %v", err)
+				os.Remove(finalPath)
+				downloadErr = err
 				continue
 			}
-			log.Printf("Remote snapshot slot: %d", remoteSlot)
-
-			// Compare with existing slot and skip download if not newer
 			if existingSlot > 0 && remoteSlot <= existingSlot {
-				log.Printf("Remote snapshot (slot %d) is not newer than existing snapshot (slot %d). Skipping download.",
+				log.Printf("Remote snapshot (slot %d) is not newer than existing snapshot (slot %d). Discarding.",
 					remoteSlot, existingSlot)
+				os.Remove(finalPath)
 				return nil
 			}
 		}
 
-		// Proceed with the download since we've confirmed it's a newer snapshot
-		finalPath, sizeBytes, downloadErr = writeSnapshotToFile(snapshotURL, tmpDir, cfg.SnapshotPath, false)
-		if downloadErr == nil {
-			log.Printf("Successfully downloaded snapshot to: %s", finalPath)
-			break
-		}
-		log.Printf("Failed to download with %s extension: %v", ext, downloadErr)
+		log.Printf("Successfully downloaded snapshot to: %s", finalPath)
+		break
 	}
 
 	if downloadErr != nil {
@@ -306,17 +275,7 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 
 	// Verify the file exists in the remote directory
 	if _, err := os.Stat(finalPath); err != nil {
-		// Try to restore from backup if the final file is missing
-		backupFile := filepath.Join(tmpDir, "backup-"+filepath.Base(finalPath))
-		if _, backupErr := os.Stat(backupFile); backupErr == nil {
-			log.Printf("Attempting to restore from backup: %s", backupFile)
-			if err := copyFile(backupFile, finalPath); err != nil {
-				return fmt.Errorf("failed to restore from backup: %v", err)
-			}
-			log.Printf("Successfully restored from backup to: %s", finalPath)
-		} else {
-			return fmt.Errorf("snapshot file not found and no backup available: %v", err)
-		}
+		return fmt.Errorf("snapshot file not found after download: %v", err)
 	}
 	log.Printf("Verified snapshot exists at: %s", finalPath)
 

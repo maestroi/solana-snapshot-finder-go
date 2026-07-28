@@ -26,6 +26,7 @@ min_download_speed: 100                             # Minimum acceptable downloa
 max_latency: 200                                    # Maximum acceptable latency (ms)
 num_of_retries: 3                                   # Number of download retry attempts
 sleep_before_retry: 5                               # Time between retries (seconds)
+speed_test_seconds: 3                               # Duration of the download speed test per node (seconds)
 denylist: []                                       # RPC nodes to exclude
 private_rpc: false                                  # Whether to use private RPCs
 worker_count: 100                                   # Number of concurrent evaluation workers
