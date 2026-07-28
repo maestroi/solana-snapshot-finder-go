@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 )
@@ -17,6 +18,7 @@ func TestMeasureSpeedStopsAtByteCap(t *testing.T) {
 		if r.Header.Get("Range") == "" {
 			t.Errorf("expected Range header")
 		}
+		w.WriteHeader(http.StatusPartialContent)
 		payload := bytes.Repeat([]byte("x"), 512*1024) // 512 KiB chunks
 		for {
 			n, err := w.Write(payload)
@@ -59,6 +61,53 @@ func TestMeasureSpeedFallsBackWithoutRange(t *testing.T) {
 
 	if _, _, err := MeasureSpeed(srv.URL, 2, 32*1024); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMeasureSpeedFallsBackOnOKWithAcceptRanges(t *testing.T) {
+	var rangeRequests, plainRequests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			rangeRequests.Add(1)
+			w.Header().Set("Accept-Ranges", "bytes")
+		} else {
+			plainRequests.Add(1)
+		}
+		w.Write(bytes.Repeat([]byte("z"), 64*1024))
+	}))
+	defer srv.Close()
+
+	if _, _, err := MeasureSpeed(srv.URL, 2, 32*1024); err != nil {
+		t.Fatal(err)
+	}
+	if rangeRequests.Load() != 1 || plainRequests.Load() != 1 {
+		t.Fatalf("expected one Range and one plain request, got Range=%d plain=%d",
+			rangeRequests.Load(), plainRequests.Load())
+	}
+}
+
+func TestMeasureSpeedStopsAtMeasureTimeWhenBodyStalls(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte("x"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	speed, _, err := MeasureSpeed(srv.URL, 1, 64*1024)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if speed <= 0 {
+		t.Fatalf("expected positive speed, got %v", speed)
+	}
+	if elapsed < 900*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("expected measurement to stop around 1s, took %v", elapsed)
 	}
 }
 

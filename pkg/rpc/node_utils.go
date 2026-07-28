@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -127,36 +128,54 @@ type NodeEvaluationResult struct {
 }
 
 func MeasureSpeed(url string, measureTime int, maxBytes int64) (speedMBs float64, latencyMs float64, err error) {
+	measureDuration := time.Duration(measureTime) * time.Second
 	timeout := 10 * time.Second
 	if measureTime > 0 {
-		timeout += time.Duration(measureTime) * time.Second
+		timeout += measureDuration
 	}
 	client := &http.Client{Timeout: timeout}
 
-	requestStart := time.Now()
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to create request: %v", err)
-	}
-	if maxBytes > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", maxBytes-1))
+	doRequest := func(useRange bool) (*http.Response, context.Context, context.CancelFunc, time.Time, error) {
+		ctx := context.Background()
+		cancel := func() {}
+		if measureDuration > 0 {
+			ctx, cancel = context.WithTimeout(ctx, measureDuration)
+		} else {
+			ctx, cancel = context.WithCancel(ctx)
+		}
+
+		requestStart := time.Now()
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if requestErr != nil {
+			cancel()
+			return nil, nil, nil, requestStart, requestErr
+		}
+		if useRange {
+			req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", maxBytes-1))
+		}
+
+		resp, requestErr := client.Do(req)
+		if requestErr != nil {
+			cancel()
+			return nil, nil, nil, requestStart, requestErr
+		}
+		return resp, ctx, cancel, requestStart, nil
 	}
 
-	resp, err := client.Do(req)
+	resp, ctx, cancel, requestStart, err := doRequest(maxBytes > 0)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to fetch URL: %v", err)
 	}
 
-	rangeAccepted := resp.StatusCode == http.StatusPartialContent ||
-		(resp.StatusCode == http.StatusOK && strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes"))
-	if maxBytes > 0 && !rangeAccepted {
+	if maxBytes > 0 && resp.StatusCode != http.StatusPartialContent {
 		resp.Body.Close()
-		requestStart = time.Now()
-		resp, err = client.Get(url)
+		cancel()
+		resp, ctx, cancel, requestStart, err = doRequest(false)
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to fetch URL without Range: %v", err)
 		}
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	latencyMs = float64(time.Since(requestStart).Milliseconds())
@@ -164,12 +183,10 @@ func MeasureSpeed(url string, measureTime int, maxBytes int64) (speedMBs float64
 		return 0, latencyMs, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
 	}
 
-	start := time.Now()
-	deadline := time.Duration(measureTime) * time.Second
 	buffer := make([]byte, 81920)
 	var totalLoaded int64
 
-	for time.Since(start) < deadline && (maxBytes <= 0 || totalLoaded < maxBytes) {
+	for time.Since(requestStart) < measureDuration && (maxBytes <= 0 || totalLoaded < maxBytes) {
 		readBuffer := buffer
 		if maxBytes > 0 && int64(len(readBuffer)) > maxBytes-totalLoaded {
 			readBuffer = readBuffer[:maxBytes-totalLoaded]
@@ -181,11 +198,14 @@ func MeasureSpeed(url string, measureTime int, maxBytes int64) (speedMBs float64
 			break
 		}
 		if readErr != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				break
+			}
 			return 0, latencyMs, fmt.Errorf("error reading response body: %v", readErr)
 		}
 	}
 
-	elapsed := time.Since(start).Seconds()
+	elapsed := time.Since(requestStart).Seconds()
 	if totalLoaded == 0 || elapsed == 0 {
 		return 0, latencyMs, fmt.Errorf("no data collected during the measurement period")
 	}
