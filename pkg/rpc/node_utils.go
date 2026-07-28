@@ -174,7 +174,14 @@ func MeasureSpeed(url string, measureTime int, maxBytes int64) (speedMBs float64
 		return 0, 0, fmt.Errorf("failed to fetch URL: %v", err)
 	}
 
-	if maxBytes > 0 && resp.StatusCode != http.StatusPartialContent {
+	// Only fall back to a plain GET when the Range request was ignored/rejected
+	// in a way a second request can fix (server doesn't support Range and sent
+	// the full body anyway, or claims the range itself is invalid). For real
+	// errors (429/403/404/5xx) a second request just doubles load on a host
+	// that's already struggling or rate-limiting us - let the status check
+	// below report the failure instead.
+	if maxBytes > 0 && resp.StatusCode != http.StatusPartialContent &&
+		(resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
 		log.Printf("Speed test %s: Range request returned %s, falling back to plain GET", url, resp.Status)
 		resp.Body.Close()
 		cancel()

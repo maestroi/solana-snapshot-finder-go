@@ -193,6 +193,41 @@ func TestMeasureSpeedFallsBackOnOKWithAcceptRanges(t *testing.T) {
 	}
 }
 
+func TestMeasureSpeedDoesNotFallbackOnRateLimit(t *testing.T) {
+	var requestCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	_, _, err := MeasureSpeed(srv.URL, 2, 32*1024)
+	if err == nil {
+		t.Fatal("expected error for 429 response, got nil")
+	}
+	if requestCount.Load() != 1 {
+		t.Fatalf("expected exactly one request (no fallback GET on 429), got %d", requestCount.Load())
+	}
+}
+
+func TestMeasureSpeedDoesNotFallbackOnServerError(t *testing.T) {
+	var requestCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	_, _, err := MeasureSpeed(srv.URL, 2, 32*1024)
+	if err == nil {
+		t.Fatal("expected error for 500 response, got nil")
+	}
+	if requestCount.Load() != 1 {
+		t.Fatalf("expected exactly one request (no fallback GET on 5xx), got %d", requestCount.Load())
+	}
+}
+
 func TestMeasureSpeedStopsAtMeasureTimeWhenBodyStalls(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusPartialContent)
