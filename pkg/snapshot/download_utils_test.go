@@ -3,6 +3,7 @@ package snapshot
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -34,14 +35,18 @@ func TestDownloadSnapshotReturnsHTTPStatusErrorWithRetryAfter(t *testing.T) {
 	}
 }
 
-func TestDownloadSnapshotRemovesIncrementalWithMismatchedBaseSlot(t *testing.T) {
-	dir := t.TempDir()
-	fullName := "snapshot-100-AbCdEfGhIjKlMnOpQrStUvWx.tar.zst"
-	if err := os.WriteFile(filepath.Join(dir, fullName), []byte("full"), 0644); err != nil {
-		t.Fatal(err)
+// downloadIncrementalAgainstLocalFull spins up a server that serves a single
+// incremental snapshot with the given base/end slots, seeds dir with a local
+// full snapshot at localFullSlot, and runs DownloadSnapshot against it.
+func downloadIncrementalAgainstLocalFull(t *testing.T, localFullSlot, incBaseSlot, incEndSlot int) (dir, incPath string, err error) {
+	t.Helper()
+	dir = t.TempDir()
+	fullName := fmt.Sprintf("snapshot-%d-AbCdEfGhIjKlMnOpQrStUvWx.tar.zst", localFullSlot)
+	if writeErr := os.WriteFile(filepath.Join(dir, fullName), []byte("full"), 0644); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 
-	incName := "incremental-snapshot-999-1000-AbCdEfGhIjKlMnOpQrStUvWx.tar.zst"
+	incName := fmt.Sprintf("incremental-snapshot-%d-%d-AbCdEfGhIjKlMnOpQrStUvWx.tar.zst", incBaseSlot, incEndSlot)
 	body := bytes.Repeat([]byte("z"), 2*1024*1024)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Disposition", `attachment; filename="`+incName+`"`)
@@ -49,16 +54,48 @@ func TestDownloadSnapshotRemovesIncrementalWithMismatchedBaseSlot(t *testing.T) 
 	}))
 	t.Cleanup(server.Close)
 
-	err := DownloadSnapshot(server.URL, config.Config{
+	err = DownloadSnapshot(server.URL, config.Config{
 		SnapshotPath:         dir,
 		IncrementalThreshold: 100000,
-	}, "incremental", 1000)
+	}, "incremental", incEndSlot)
 
-	if err == nil {
-		t.Fatal("DownloadSnapshot() error = nil, want base-slot mismatch error")
+	incPath = filepath.Join(dir, "remote", incName)
+	return dir, incPath, err
+}
+
+func TestDownloadSnapshotRemovesIncrementalOlderThanLocalFull(t *testing.T) {
+	_, incPath, err := downloadIncrementalAgainstLocalFull(t, 1000, 500, 999)
+
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("DownloadSnapshot() error = %v, want *ValidationError", err)
 	}
-	incPath := filepath.Join(dir, "remote", incName)
 	if _, statErr := os.Stat(incPath); !os.IsNotExist(statErr) {
-		t.Fatalf("mismatched incremental stat error = %v, want file not found", statErr)
+		t.Fatalf("stale incremental stat error = %v, want file not found", statErr)
+	}
+}
+
+func TestDownloadSnapshotKeepsIncrementalAheadOfLocalFull(t *testing.T) {
+	// Simulates a "safety" incremental fetched before a newer full snapshot
+	// lands: its base matches the remote full, but the *local* full on disk
+	// is still the older/stale one, so base slot > local full slot.
+	_, incPath, err := downloadIncrementalAgainstLocalFull(t, 100, 999, 1000)
+
+	if err != nil {
+		t.Fatalf("DownloadSnapshot() error = %v, want nil (safety incremental should be kept)", err)
+	}
+	if _, statErr := os.Stat(incPath); statErr != nil {
+		t.Fatalf("safety incremental stat error = %v, want file present", statErr)
+	}
+}
+
+func TestDownloadSnapshotKeepsIncrementalMatchingLocalFull(t *testing.T) {
+	_, incPath, err := downloadIncrementalAgainstLocalFull(t, 100, 100, 1000)
+
+	if err != nil {
+		t.Fatalf("DownloadSnapshot() error = %v, want nil", err)
+	}
+	if _, statErr := os.Stat(incPath); statErr != nil {
+		t.Fatalf("matching incremental stat error = %v, want file present", statErr)
 	}
 }

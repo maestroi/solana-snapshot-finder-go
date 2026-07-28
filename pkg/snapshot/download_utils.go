@@ -26,6 +26,24 @@ func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("snapshot request returned status %d for %s", e.StatusCode, e.URL)
 }
 
+// ValidationError indicates the downloaded file itself failed a content check
+// (e.g. slot mismatch) rather than a transport/HTTP failure. Callers should
+// not treat the source host as permanently bad for this - it may just have
+// served a snapshot that's stale relative to what we already have locally.
+type ValidationError struct {
+	msg string
+}
+
+func (e *ValidationError) Error() string {
+	return e.msg
+}
+
+// NewValidationError constructs a ValidationError for callers/tests outside
+// this package that need to simulate a content-validation failure.
+func NewValidationError(msg string) *ValidationError {
+	return &ValidationError{msg: msg}
+}
+
 type ProgressWriter struct {
 	TotalBytes   int64
 	Downloaded   int64
@@ -239,10 +257,21 @@ func validateDownloadedIncremental(cfg config.Config, finalPath string, referenc
 		return nil
 	}
 
-	if slotStart != fullSlot {
-		log.Printf("Incremental base slot %d does not match full snapshot slot %d — removing and failing attempt", slotStart, fullSlot)
+	// The incremental is only unusable if it's older than the full snapshot we
+	// already have on disk (its base predates our base, so it can't apply cleanly).
+	// If it's ahead of - or equal to - our local full, it's either a match or a
+	// legitimate "safety" incremental fetched before a newer full snapshot landed
+	// (the local full is stale at comparison time but the safety incremental's
+	// base matches the *remote* full that's still downloading). Keep it either way.
+	if slotStart < fullSlot {
+		log.Printf("Incremental base slot %d is older than local full snapshot slot %d — removing and failing attempt", slotStart, fullSlot)
 		_ = os.Remove(finalPath)
-		return fmt.Errorf("incremental base slot %d != full slot %d", slotStart, fullSlot)
+		return &ValidationError{msg: fmt.Sprintf("incremental base slot %d < full slot %d", slotStart, fullSlot)}
+	}
+
+	if slotStart > fullSlot {
+		log.Printf("Incremental base slot %d is ahead of local full snapshot slot %d — keeping as safety incremental", slotStart, fullSlot)
+		return nil
 	}
 
 	return nil
