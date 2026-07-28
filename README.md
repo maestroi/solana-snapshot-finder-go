@@ -12,7 +12,7 @@ Solana Snapshot Finder is a Go utility designed to efficiently manage Solana blo
 - **Single-Pass Evaluation with Re-Score**: Probes and speed-tests once per run; relaxation attempts only re-classify stored measurements (no re-probe)
 - **Warm-Start Priority**: Reuses prior `nodes_attempt_*.json` results to probe known-good peers first when enough cached nodes exist
 - **Download Cooldown & Retry-After**: Failed or rate-limited hosts are excluded for the rest of the run; HTTP 429 responses honor `Retry-After` before the next attempt
-- **Strict Incremental Validation**: Incremental downloads whose base slot does not match the local full snapshot are removed and fail the attempt (triggers node rotation)
+- **Strict Incremental Validation**: Incremental base slots older than the local full are removed and fail the attempt; bases ahead of the local full are kept as safety incrementals (for download-before-full)
 - **Automated Cleanup**: Removes outdated snapshots to save disk space while maintaining necessary backups
 - **Full & Incremental Support**: Handles both full and incremental snapshots with proper slot validation
 - **Adaptive Retry Logic**: Gradually relaxes speed and latency requirements on retry attempts to ensure snapshot acquisition
@@ -69,7 +69,7 @@ The run proceeds through clear phases logged to stdout:
    - Keeps only the closest `speed_test_candidates` (default 30) for Phase B
 
 3. **Phase B — Speed Test** (`speed_test_workers` concurrency, separate from Phase A):
-   - Timed GET with `Range: bytes=0-(speed_test_max_bytes-1)` when supported; falls back to plain GET if Range is rejected
+   - Prefers `Range: bytes=0-(speed_test_max_bytes-1)`; falls back to a capped plain GET on HTTP 200/416 (many Solana RPC hosts ignore Range and answer 200)
    - Full slot: uses HEAD-derived filename slot when available (no RPC reconcile); otherwise `getHighestSnapshotSlots` / `getSlot`
    - Incremental slot for evaluation: always from RPC, never from incremental HEAD
    - Classifies nodes as good, slow, or bad based on speed, latency, and slot thresholds
@@ -86,11 +86,27 @@ The run proceeds through clear phases logged to stdout:
 6. **Download**:
    - No HEAD pre-check before GET (node was already probed; avoids extra 429 risk)
    - On failure or HTTP 429: host enters cooldown, `Retry-After` is honored before the next attempt, rotation via `SelectNextRPC`
-   - Incremental: if downloaded base slot ≠ local full snapshot slot, file is removed and the attempt fails
+   - Incremental: base older than local full → remove and fail; base ahead of local full → keep (safety); equal → keep
 
 7. **Snapshot Management**:
    - Stores snapshots under `snapshot_path` and `snapshot_path/remote`
    - Cleans up old snapshots based on configurable thresholds
+
+## Observed performance (devnet)
+
+Measured on a Blockdaemon devnet RPC node after deploying this branch (`speed_test_workers: 5`, `speed_test_max_bytes: 256 MiB`, `full_threshold: 100000`, `incremental_threshold: 500`):
+
+| Scenario | What happened | Wall time |
+|----------|---------------|-----------|
+| Incremental-only refresh | Local full still within threshold; probed ~20 RPCs, picked ~409 MB/s peer, downloaded ~42 MB incremental | ~15 s end-to-end |
+| Cold start (empty ledger) | Safety incremental → ~50 GB full at ~451 MB/s → fresher incremental | ~2 min (full download ~1m46s) |
+| Restart with fresh locals | Diffs within thresholds → exit without probe/download | &lt; 1 s |
+
+Notes from those runs:
+
+- Warm-start reused prior `nodes_attempt_*.json` (11 cached good/slow peers)
+- Evaluation stayed single-pass (no re-probe on relaxation)
+- Most RPC hosts returned `200 OK` to Range speed tests, so the client fell back to plain GET as designed
 
 ## Usage
 
