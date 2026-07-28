@@ -111,6 +111,36 @@ func TestMeasureSpeedStopsAtMeasureTimeWhenBodyStalls(t *testing.T) {
 	}
 }
 
+func TestMeasureSpeedStartsMeasureTimeAfterHeaders(t *testing.T) {
+	const headerDelay = 300 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(headerDelay)
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte("x"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	speed, latency, err := MeasureSpeed(srv.URL, 1, 64*1024)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if speed <= 0 {
+		t.Fatalf("expected positive speed, got %v", speed)
+	}
+	if latency < float64(headerDelay.Milliseconds()) {
+		t.Fatalf("expected latency of at least %v, got %.0fms", headerDelay, latency)
+	}
+	if elapsed < headerDelay+900*time.Millisecond || elapsed > headerDelay+2*time.Second {
+		t.Fatalf("expected full measurement window after headers, took %v", elapsed)
+	}
+}
+
 func TestFilterResultsByMaxSlot(t *testing.T) {
 	results := []NodeEvaluationResult{
 		{RPC: "a", FullSlot: 100, Speed: 50, Status: "good"},

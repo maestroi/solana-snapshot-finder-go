@@ -136,13 +136,7 @@ func MeasureSpeed(url string, measureTime int, maxBytes int64) (speedMBs float64
 	client := &http.Client{Timeout: timeout}
 
 	doRequest := func(useRange bool) (*http.Response, context.Context, context.CancelFunc, time.Time, error) {
-		ctx := context.Background()
-		cancel := func() {}
-		if measureDuration > 0 {
-			ctx, cancel = context.WithTimeout(ctx, measureDuration)
-		} else {
-			ctx, cancel = context.WithCancel(ctx)
-		}
+		ctx, cancel := context.WithCancel(context.Background())
 
 		requestStart := time.Now()
 		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -183,10 +177,16 @@ func MeasureSpeed(url string, measureTime int, maxBytes int64) (speedMBs float64
 		return 0, latencyMs, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
 	}
 
+	measureStart := time.Now()
+	if measureDuration > 0 {
+		timer := time.AfterFunc(measureDuration, cancel)
+		defer timer.Stop()
+	}
+
 	buffer := make([]byte, 81920)
 	var totalLoaded int64
 
-	for time.Since(requestStart) < measureDuration && (maxBytes <= 0 || totalLoaded < maxBytes) {
+	for time.Since(measureStart) < measureDuration && (maxBytes <= 0 || totalLoaded < maxBytes) {
 		readBuffer := buffer
 		if maxBytes > 0 && int64(len(readBuffer)) > maxBytes-totalLoaded {
 			readBuffer = readBuffer[:maxBytes-totalLoaded]
@@ -198,14 +198,14 @@ func MeasureSpeed(url string, measureTime int, maxBytes int64) (speedMBs float64
 			break
 		}
 		if readErr != nil {
-			if ctx.Err() == context.DeadlineExceeded {
+			if ctx.Err() == context.Canceled && time.Since(measureStart) >= measureDuration {
 				break
 			}
 			return 0, latencyMs, fmt.Errorf("error reading response body: %v", readErr)
 		}
 	}
 
-	elapsed := time.Since(requestStart).Seconds()
+	elapsed := time.Since(measureStart).Seconds()
 	if totalLoaded == 0 || elapsed == 0 {
 		return 0, latencyMs, fmt.Errorf("no data collected during the measurement period")
 	}
