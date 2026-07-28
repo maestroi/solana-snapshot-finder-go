@@ -222,6 +222,32 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 	return finalFilePath, totalBytes, nil
 }
 
+func validateDownloadedIncremental(cfg config.Config, finalPath string, referenceSlot int) error {
+	slotStart, slotEnd, err := ExtractIncrementalSnapshotSlots(finalPath)
+	if err != nil {
+		log.Printf("Warning: Failed to extract slots from incremental snapshot: %v", err)
+		return nil
+	}
+
+	if referenceSlot-slotEnd > cfg.IncrementalThreshold {
+		log.Printf("Warning: Incremental snapshot might be old, but keeping it anyway")
+	}
+
+	_, fullSlot, err := findRecentFullSnapshot(cfg.SnapshotPath, referenceSlot, 0)
+	if err != nil {
+		log.Printf("Warning: Could not find full snapshot: %v", err)
+		return nil
+	}
+
+	if slotStart != fullSlot {
+		log.Printf("Incremental base slot %d does not match full snapshot slot %d — removing and failing attempt", slotStart, fullSlot)
+		_ = os.Remove(finalPath)
+		return fmt.Errorf("incremental base slot %d != full slot %d", slotStart, fullSlot)
+	}
+
+	return nil
+}
+
 func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string, referenceSlot int) error {
 	log.Printf("Downloading %s snapshot from %s", snapshotType, rpcAddress)
 
@@ -356,24 +382,8 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 			log.Printf("Warning: Downloaded snapshot might be old, but keeping it anyway")
 		}
 	} else {
-		slotStart, slotEnd, err := ExtractIncrementalSnapshotSlots(finalPath)
-		if err != nil {
-			log.Printf("Warning: Failed to extract slots from incremental snapshot: %v", err)
-			return nil
-		}
-
-		if referenceSlot-slotEnd > cfg.IncrementalThreshold {
-			log.Printf("Warning: Incremental snapshot might be old, but keeping it anyway")
-		}
-
-		_, fullSlot, err := findRecentFullSnapshot(cfg.SnapshotPath, referenceSlot, 0)
-		if err != nil {
-			log.Printf("Warning: Could not find full snapshot: %v", err)
-			return nil
-		}
-
-		if slotStart != fullSlot {
-			log.Printf("Warning: Incremental snapshot might not match full snapshot, but keeping it anyway")
+		if err := validateDownloadedIncremental(cfg, finalPath, referenceSlot); err != nil {
+			return err
 		}
 	}
 
