@@ -17,12 +17,13 @@ incremental_threshold: 500
 # How many latency-shortlisted candidates get a real speed test per attempt.
 # Keep this small - it's the only phase that pulls real bandwidth from other nodes.
 speed_test_candidates: 30
+speed_test_seconds: 3
 # Phase B speed-test concurrency (separate from worker_count / Phase A probes).
-# speed_test_workers: 5
+speed_test_workers: 5
 # Max bytes read during a speed test (256 MiB default).
-# speed_test_max_bytes: 268435456
+speed_test_max_bytes: 268435456
 # Minimum cached good/slow nodes before warm-start activates.
-# warm_start_min_nodes: 3
+warm_start_min_nodes: 3
 speed_relaxation_factor: 0.9
 latency_relaxation_factor: 0.9
 max_relaxation_attempts: 3

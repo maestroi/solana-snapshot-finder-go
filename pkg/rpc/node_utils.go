@@ -175,6 +175,7 @@ func MeasureSpeed(url string, measureTime int, maxBytes int64) (speedMBs float64
 	}
 
 	if maxBytes > 0 && resp.StatusCode != http.StatusPartialContent {
+		log.Printf("Speed test %s: Range request returned %s, falling back to plain GET", url, resp.Status)
 		resp.Body.Close()
 		cancel()
 		resp, ctx, cancel, requestStart, err = doRequest(false)
@@ -305,6 +306,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	}
 
 	// Phase A: cheap probe (health + snapshot availability + latency) on every node.
+	log.Printf("Phase A: probing %d nodes with %d workers", len(nodes), cfg.WorkerCount)
 	var candMu sync.Mutex
 	var candidates []probeCandidate
 	var wg sync.WaitGroup
@@ -351,9 +353,12 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	if speedTestLimit <= 0 {
 		speedTestLimit = 30
 	}
-	if len(candidates) > speedTestLimit {
-		log.Printf("Speed-testing the %d closest candidates by latency (skipping the rest to limit load on the network)", speedTestLimit)
+	totalCandidates := len(candidates)
+	if totalCandidates > speedTestLimit {
+		log.Printf("Phase: shortlist — keeping %d/%d closest candidates by latency", speedTestLimit, totalCandidates)
 		candidates = candidates[:speedTestLimit]
+	} else if totalCandidates > 0 {
+		log.Printf("Phase: shortlist — all %d candidates proceed to speed test", totalCandidates)
 	}
 
 	// Phase B: real bandwidth speed test, only against the shortlisted candidates.
@@ -406,6 +411,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 				fullSlot = slots.Full
 				incrementalSlot = slots.Incremental
 				slot = fullSlot // Use full slot as the reference
+				log.Printf("Node %s: full slot %d from RPC getHighestSnapshotSlots", c.rpc, fullSlot)
 			} else {
 				log.Printf("Node %s: getHighestSnapshotSlots failed, trying getSlot: %v", c.rpc, err)
 				slot, err = GetReferenceSlot(c.rpc)

@@ -59,9 +59,11 @@ func cleanupFailedDownloads(snapshotPath string) {
 func recordDownloadFailure(cooldown *rpc.HostCooldown, rpcAddress string, err error) {
 	var statusErr *snapshot.HTTPStatusError
 	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusTooManyRequests {
+		log.Printf("Cooldown: excluding %s (HTTP 429, Retry-After: %s)", rpcAddress, statusErr.RetryAfter)
 		cooldown.MarkRetryAfter(rpcAddress, statusErr.RetryAfter)
 		return
 	}
+	log.Printf("Cooldown: excluding %s (%s)", rpcAddress, err.Error())
 	cooldown.Mark(rpcAddress, err.Error())
 }
 
@@ -179,7 +181,9 @@ func processSnapshots(cfg config.Config) {
 
 	// Probe and speed-test once, then only re-score the stored measurements as
 	// speed and latency requirements are relaxed.
+	log.Println("Phase: evaluate — probe, shortlist, and speed-test (single pass)")
 	results = rpc.EvaluateNodesWithVersions(nodes, cfg, referenceSlot)
+	log.Println("Phase: select — choosing download RPC from evaluation results")
 	for attempt := 1; attempt <= cfg.MaxRelaxationAttempts; attempt++ {
 		log.Printf("Evaluating nodes - Attempt %d/%d", attempt, cfg.MaxRelaxationAttempts)
 
@@ -243,6 +247,7 @@ func processSnapshots(cfg config.Config) {
 	log.Printf("Selected RPC: %s", bestRPC)
 
 	// Download snapshots with retry logic
+	log.Println("Phase: download — starting snapshot downloads")
 	maxDownloadRetries := cfg.MaxDownloadRetries
 	cooldown := &rpc.HostCooldown{}
 	for downloadAttempt := 1; downloadAttempt <= maxDownloadRetries; downloadAttempt++ {
