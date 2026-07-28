@@ -319,6 +319,19 @@ func TestReclassifyResultsDoesNotPromoteBadOrRelaxSlotRules(t *testing.T) {
 	}
 }
 
+func TestReclassifyResultsPromotesPreviouslyAcceptedHistoricalStaticNode(t *testing.T) {
+	results := []NodeEvaluationResult{
+		{RPC: "static", Speed: 60, Latency: 100, FullSlot: 1_000_000, Diff: 0, Status: "slow"},
+	}
+	cfg := config.Config{MinDownloadSpeed: 50, MaxLatency: 200, MaxSlot: 900_000}
+
+	out := ReclassifyResults(results, cfg, 1_000_000)
+
+	if out[0].Status != "good" {
+		t.Fatalf("historical static node status=%q want good", out[0].Status)
+	}
+}
+
 func TestRelaxedConfigForAttemptAppliesCumulativeFactors(t *testing.T) {
 	cfg := config.Config{
 		MinDownloadSpeed:        100,

@@ -526,10 +526,9 @@ func ReclassifyResults(results []NodeEvaluationResult, cfg config.Config, _ int)
 			continue
 		}
 
-		slotOK := result.Diff <= slotThreshold
-		if cfg.MaxSlot > 0 {
-			slotOK = result.FullSlot > 0 && int64(result.FullSlot) <= cfg.MaxSlot
-		}
+		// Historical slot validation already happened during the initial
+		// evaluation; non-bad results (including static nodes) passed it.
+		slotOK := cfg.MaxSlot > 0 || result.Diff <= slotThreshold
 
 		switch {
 		case result.Speed >= float64(cfg.MinDownloadSpeed) &&
