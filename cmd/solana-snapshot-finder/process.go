@@ -63,6 +63,14 @@ func recordDownloadFailure(cooldown *rpc.HostCooldown, rpcAddress string, err er
 		cooldown.MarkRetryAfter(rpcAddress, statusErr.RetryAfter)
 		return
 	}
+	// Content validation failures (e.g. incremental base-slot mismatch) are not
+	// evidence the host is bad - don't permanently exclude it, just let the
+	// caller rotate to the next RPC (or retry the same one) for this attempt.
+	var validationErr *snapshot.ValidationError
+	if errors.As(err, &validationErr) {
+		log.Printf("Validation failed for %s (%s) - rotating without excluding host", rpcAddress, err.Error())
+		return
+	}
 	log.Printf("Cooldown: excluding %s (%s)", rpcAddress, err.Error())
 	cooldown.Mark(rpcAddress, err.Error())
 }

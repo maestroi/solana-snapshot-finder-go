@@ -29,6 +29,17 @@ func TestRecordDownloadFailureExcludesHostAndKeepsRetryAfter(t *testing.T) {
 	}
 }
 
+func TestRecordDownloadFailureDoesNotExcludeOnValidationError(t *testing.T) {
+	cooldown := &rpc.HostCooldown{}
+	valErr := snapshot.NewValidationError("incremental base slot 1 < full slot 2")
+
+	recordDownloadFailure(cooldown, "http://safety-node", fmt.Errorf("validate: %w", valErr))
+
+	if cooldown.IsExcluded("http://safety-node") {
+		t.Fatal("recordDownloadFailure() excluded host on validation error, want no exclusion")
+	}
+}
+
 func TestRecordDownloadFailureExcludesHardFailure(t *testing.T) {
 	cooldown := &rpc.HostCooldown{}
 
