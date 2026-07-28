@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,7 +13,18 @@ import (
 	"time"
 
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
+	"github.com/maestroi/solana-snapshot-finder-go/pkg/rpc"
 )
+
+type HTTPStatusError struct {
+	StatusCode int
+	RetryAfter time.Duration
+	URL        string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("snapshot request returned status %d for %s", e.StatusCode, e.URL)
+}
 
 type ProgressWriter struct {
 	TotalBytes   int64
@@ -61,7 +73,7 @@ func DownloadGenesis(rpcAddress, snapshotPath string) error {
 	genesisURL := fmt.Sprintf("%s/genesis.tar.bz2", rpcAddress)
 	_, _, err := writeSnapshotToFile(genesisURL, tmpDir, snapshotPath, true)
 	if err != nil {
-		return fmt.Errorf("failed to download genesis snapshot: %v", err)
+		return fmt.Errorf("failed to download genesis snapshot: %w", err)
 	}
 
 	return nil
@@ -103,7 +115,12 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("snapshot request returned status %d for %s", resp.StatusCode, snapshotURL)
+		retryAfter, _ := rpc.ParseRetryAfter(resp.Header, time.Now())
+		return "", 0, &HTTPStatusError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: retryAfter,
+			URL:        snapshotURL,
+		}
 	}
 
 	// Abort early if Content-Length says we don't have enough free space
@@ -261,6 +278,10 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 		finalPath, sizeBytes, downloadErr = writeSnapshotToFile(snapshotURL, tmpDir, cfg.SnapshotPath, false)
 		if downloadErr != nil {
 			log.Printf("Failed to download with %s extension: %v", ext, downloadErr)
+			var statusErr *HTTPStatusError
+			if errors.As(downloadErr, &statusErr) && statusErr.StatusCode == http.StatusTooManyRequests {
+				return fmt.Errorf("failed to download snapshot: %w", downloadErr)
+			}
 			continue
 		}
 
@@ -294,7 +315,7 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 	}
 
 	if downloadErr != nil {
-		return fmt.Errorf("failed to download snapshot with any extension: %v", downloadErr)
+		return fmt.Errorf("failed to download snapshot with any extension: %w", downloadErr)
 	}
 
 	// Verify the file exists in the remote directory
