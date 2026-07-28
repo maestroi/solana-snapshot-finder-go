@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,31 +56,62 @@ func cleanupFailedDownloads(snapshotPath string) {
 	log.Println("Cleanup completed, ready for retry")
 }
 
-// selectNextRPC returns the fastest "good" node not in the excluded set, falling back to "slow".
-func selectNextRPC(results []rpc.NodeEvaluationResult, exclude map[string]bool) string {
-	best := ""
-	bestSpeed := 0.0
+func recordDownloadFailure(cooldown *rpc.HostCooldown, rpcAddress string, err error) {
+	var statusErr *snapshot.HTTPStatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusTooManyRequests {
+		log.Printf("Cooldown: excluding %s (HTTP 429, Retry-After: %s)", rpcAddress, statusErr.RetryAfter)
+		cooldown.MarkRetryAfter(rpcAddress, statusErr.RetryAfter)
+		return
+	}
+	// Content validation failures (e.g. incremental base-slot mismatch) are not
+	// evidence the host is bad - don't permanently exclude it, just let the
+	// caller rotate to the next RPC (or retry the same one) for this attempt.
+	var validationErr *snapshot.ValidationError
+	if errors.As(err, &validationErr) {
+		log.Printf("Validation failed for %s (%s) - rotating without excluding host", rpcAddress, err.Error())
+		return
+	}
+	log.Printf("Cooldown: excluding %s (%s)", rpcAddress, err.Error())
+	cooldown.Mark(rpcAddress, err.Error())
+}
+
+func waitForRetry(cooldown *rpc.HostCooldown, sleep func(time.Duration)) {
+	if cooldown.RetryAfter <= 0 {
+		return
+	}
+	delay := cooldown.RetryAfter
+	cooldown.RetryAfter = 0
+	log.Printf("Rate limited; waiting %s before next download attempt", delay)
+	sleep(delay)
+}
+
+func handleSafetyDownloadFailure(
+	results []rpc.NodeEvaluationResult,
+	cooldown *rpc.HostCooldown,
+	currentRPC string,
+	failedRPC string,
+	err error,
+	sleep func(time.Duration),
+) string {
+	recordDownloadFailure(cooldown, failedRPC, err)
+	nextRPC := currentRPC
+	if next := rpc.SelectNextRPC(results, cooldown); next != "" {
+		nextRPC = next
+	}
+	if nextRPC != currentRPC {
+		log.Printf("Switching from %s to %s", currentRPC, nextRPC)
+	}
+	waitForRetry(cooldown, sleep)
+	return nextRPC
+}
+
+func fullSlotForRPC(results []rpc.NodeEvaluationResult, rpcAddr string) int {
 	for _, r := range results {
-		if exclude[r.RPC] {
-			continue
-		}
-		if r.Status == "good" && r.Speed > bestSpeed {
-			best, bestSpeed = r.RPC, r.Speed
+		if r.RPC == rpcAddr && r.FullSlot > 0 {
+			return r.FullSlot
 		}
 	}
-	if best != "" {
-		return best
-	}
-	// fallback: slow nodes
-	for _, r := range results {
-		if exclude[r.RPC] {
-			continue
-		}
-		if r.Status == "slow" && r.Speed > bestSpeed {
-			best, bestSpeed = r.RPC, r.Speed
-		}
-	}
-	return best
+	return 0
 }
 
 // processSnapshots manages the snapshot download process
@@ -100,9 +133,12 @@ func processSnapshots(cfg config.Config) {
 		log.Fatalf("Failed to create remote directory: %v", err)
 	}
 
-	// Get highest snapshot slots from RPC
+	snapshot.LogDiskSpace(cfg.SnapshotPath)
+
+	// Get highest snapshot slots from RPC, trying each configured endpoint in order
+	endpoints := cfg.RPCEndpoints()
 	var referenceSlot int
-	if slots, err := rpc.GetHighestSnapshotSlots(cfg.RPCAddress); err == nil {
+	if slots, err := rpc.GetHighestSnapshotSlotsFromAny(endpoints); err == nil {
 		// Use the incremental slot as reference since it's typically higher
 		referenceSlot = slots.Incremental
 		log.Printf("Snapshot slots - Full: %d, Incremental: %d (using incremental: %d as reference)",
@@ -110,7 +146,7 @@ func processSnapshots(cfg config.Config) {
 	} else {
 		log.Printf("Failed to get highest snapshot slots, falling back to getSlot: %v", err)
 		// Fallback to the original getSlot method if getHighestSnapshotSlots fails
-		referenceSlot, err = rpc.GetReferenceSlot(cfg.RPCAddress)
+		referenceSlot, err = rpc.GetReferenceSlotFromAny(endpoints)
 		if err != nil {
 			log.Fatalf("Failed to get reference slot: %v", err)
 		}
@@ -119,6 +155,13 @@ func processSnapshots(cfg config.Config) {
 
 	// Check if we need new snapshots
 	needFull, needIncremental := snapshot.ManageSnapshots(cfg, referenceSlot)
+
+	// Historical mode: always fetch a full snapshot at or before max_slot.
+	if cfg.MaxSlot > 0 {
+		log.Printf("Filtering for snapshots with slot <= %d", cfg.MaxSlot)
+		needFull = true
+		needIncremental = false
+	}
 
 	// If no snapshots are needed and genesis is present, exit successfully
 	if !needFull && !needIncremental && snapshot.IsGenesisPresent(cfg.SnapshotPath) {
@@ -132,24 +175,37 @@ func processSnapshots(cfg config.Config) {
 		log.Fatal("No RPC nodes available.")
 	}
 
+	if warm := rpc.LoadWarmStartRPCs(cfg.SnapshotPath, cfg.WarmStartMinNodes); len(warm) > 0 {
+		log.Printf("Warm-start: prioritizing %d cached good/slow nodes", len(warm))
+		nodes = rpc.PrioritizeNodes(nodes, warm)
+	} else {
+		log.Printf("Warm-start: skipped (need >= %d good/slow in nodes_attempt_*.json)", cfg.WarmStartMinNodes)
+	}
+
 	// Evaluate nodes with retry logic and relaxed requirements
 	var results []rpc.NodeEvaluationResult
 	var bestRPC string
 	var outputFile string
 
-	// Try to find suitable nodes with gradually relaxed requirements
+	// Probe and speed-test once, then only re-score the stored measurements as
+	// speed and latency requirements are relaxed.
+	log.Println("Phase: evaluate — probe, shortlist, and speed-test (single pass)")
+	results = rpc.EvaluateNodesWithVersions(nodes, cfg, referenceSlot)
+	log.Println("Phase: select — choosing download RPC from evaluation results")
 	for attempt := 1; attempt <= cfg.MaxRelaxationAttempts; attempt++ {
 		log.Printf("Evaluating nodes - Attempt %d/%d", attempt, cfg.MaxRelaxationAttempts)
 
-		if attempt == 1 {
-			// First attempt with original requirements
-			results = rpc.EvaluateNodesWithVersions(nodes, cfg, referenceSlot)
-		} else {
-			// Subsequent attempts with relaxed requirements
-			results = rpc.EvaluateNodesWithRelaxedRequirements(nodes, cfg, referenceSlot, attempt)
+		if attempt > 1 {
+			attemptCfg := rpc.RelaxedConfigForAttempt(cfg, attempt)
+			results = rpc.ReclassifyResults(results, attemptCfg, referenceSlot)
 		}
 
 		rpc.SummarizeResultsWithVersions(results)
+
+		// Historical mode: keep only nodes with the newest FullSlot <= max_slot
+		if cfg.MaxSlot > 0 {
+			results = rpc.FilterResultsByMaxSlot(results, cfg.MaxSlot)
+		}
 
 		// Save good and slow nodes to file
 		outputFile = filepath.Join(cfg.SnapshotPath, fmt.Sprintf("nodes_attempt_%d.json", attempt))
@@ -199,9 +255,13 @@ func processSnapshots(cfg config.Config) {
 	log.Printf("Selected RPC: %s", bestRPC)
 
 	// Download snapshots with retry logic
+	log.Println("Phase: download — starting snapshot downloads")
 	maxDownloadRetries := cfg.MaxDownloadRetries
-	failedNodes := make(map[string]bool)
+	cooldown := &rpc.HostCooldown{}
 	for downloadAttempt := 1; downloadAttempt <= maxDownloadRetries; downloadAttempt++ {
+		if downloadAttempt > 1 {
+			waitForRetry(cooldown, time.Sleep)
+		}
 		log.Printf("Download attempt %d/%d", downloadAttempt, maxDownloadRetries)
 
 		// Download genesis snapshot if not present
@@ -209,7 +269,12 @@ func processSnapshots(cfg config.Config) {
 			log.Println("Genesis snapshot not found. Downloading from fastest node...")
 			if err := snapshot.DownloadGenesis(bestRPC, cfg.SnapshotPath); err != nil {
 				log.Printf("Failed to download genesis snapshot on attempt %d: %v", downloadAttempt, err)
+				recordDownloadFailure(cooldown, bestRPC, err)
 				if downloadAttempt < maxDownloadRetries {
+					if next := rpc.SelectNextRPC(results, cooldown); next != "" {
+						log.Printf("Switching from %s to %s", bestRPC, next)
+						bestRPC = next
+					}
 					log.Println("Cleaning up failed download and retrying...")
 					cleanupFailedDownloads(cfg.SnapshotPath)
 					continue
@@ -233,14 +298,47 @@ func processSnapshots(cfg config.Config) {
 			log.Println("Genesis snapshot untarred successfully")
 		}
 
+		var safetyIncrementalRPC string
+
 		// Download full snapshot if needed
 		if needFull {
+			remoteFullSlot := fullSlotForRPC(results, bestRPC)
+
+			// Safety mode: grab a matching incremental before the long full download
+			// so a usable incremental exists if the full download outlives the expiry window.
+			if cfg.DownloadIncrementalFirst && remoteFullSlot > 0 && cfg.MaxSlot <= 0 {
+				log.Println("Safety mode: downloading incremental before full snapshot...")
+				log.Println("This ensures a valid incremental exists if full download exceeds expiry window")
+				matchInfo, err := rpc.FindMatchingIncremental(results, remoteFullSlot)
+				if err != nil {
+					log.Printf("Warning: No matching safety incremental found: %v", err)
+					log.Println("Continuing with full snapshot download...")
+				} else {
+					log.Printf("Found safety incremental at %s (base=%d, end=%d)",
+						matchInfo.NodeRPC, matchInfo.BaseSlot, matchInfo.EndSlot)
+					if err := snapshot.DownloadSnapshot(matchInfo.NodeRPC, cfg, "incremental-", referenceSlot); err != nil {
+						log.Printf("Warning: Failed to download safety incremental: %v", err)
+						bestRPC = handleSafetyDownloadFailure(
+							results,
+							cooldown,
+							bestRPC,
+							matchInfo.NodeRPC,
+							err,
+							time.Sleep,
+						)
+					} else {
+						safetyIncrementalRPC = matchInfo.NodeRPC
+						log.Println("Safety incremental downloaded successfully")
+					}
+				}
+			}
+
 			log.Println("Downloading full snapshot...")
 			if err := snapshot.DownloadSnapshot(bestRPC, cfg, "snapshot-", referenceSlot); err != nil {
 				log.Printf("Failed to download full snapshot on attempt %d: %v", downloadAttempt, err)
+				recordDownloadFailure(cooldown, bestRPC, err)
 				if downloadAttempt < maxDownloadRetries {
-					failedNodes[bestRPC] = true
-					if next := selectNextRPC(results, failedNodes); next != "" {
+					if next := rpc.SelectNextRPC(results, cooldown); next != "" {
 						log.Printf("Switching from %s to %s", bestRPC, next)
 						bestRPC = next
 					}
@@ -254,14 +352,20 @@ func processSnapshots(cfg config.Config) {
 			log.Println("Full snapshot downloaded successfully")
 		}
 
-		// Download incremental snapshot if needed
+		// Download incremental snapshot if needed (skip if safety incremental already covered it
+		// from the same node and we don't otherwise need a fresher one — still refresh when needIncremental).
 		if needIncremental {
 			log.Println("Downloading incremental snapshot...")
-			if err := snapshot.DownloadSnapshot(bestRPC, cfg, "incremental-", referenceSlot); err != nil {
+			incSource := bestRPC
+			if safetyIncrementalRPC != "" && safetyIncrementalRPC != bestRPC {
+				// Prefer a node we already know has a matching incremental
+				incSource = safetyIncrementalRPC
+			}
+			if err := snapshot.DownloadSnapshot(incSource, cfg, "incremental-", referenceSlot); err != nil {
 				log.Printf("Failed to download incremental snapshot on attempt %d: %v", downloadAttempt, err)
+				recordDownloadFailure(cooldown, incSource, err)
 				if downloadAttempt < maxDownloadRetries {
-					failedNodes[bestRPC] = true
-					if next := selectNextRPC(results, failedNodes); next != "" {
+					if next := rpc.SelectNextRPC(results, cooldown); next != "" {
 						log.Printf("Switching from %s to %s", bestRPC, next)
 						bestRPC = next
 					}
@@ -280,10 +384,14 @@ func processSnapshots(cfg config.Config) {
 		break
 	}
 
-	// Clean up old snapshots
-	if err := snapshot.CleanupOldSnapshots(cfg.SnapshotPath, referenceSlot, cfg.FullThreshold, cfg.IncrementalThreshold); err != nil {
-		log.Printf("Failed to clean up old snapshots: %v", err)
+	// Clean up old snapshots (skip in historical mode so we don't delete the pinned snapshot)
+	if cfg.MaxSlot <= 0 {
+		if err := snapshot.CleanupOldSnapshots(cfg.SnapshotPath, referenceSlot, cfg.FullThreshold, cfg.IncrementalThreshold); err != nil {
+			log.Printf("Failed to clean up old snapshots: %v", err)
+		}
+		snapshot.EnforceRetentionLimit(cfg.SnapshotPath, cfg.MaxFullSnapshots)
 	}
 
+	snapshot.LogDiskSpace(cfg.SnapshotPath)
 	log.Println("All snapshots are up to date. Exiting...")
 }

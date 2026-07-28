@@ -8,98 +8,105 @@ Solana Snapshot Finder is a Go utility designed to efficiently manage Solana blo
 
 - **Smart Snapshot Detection**: Identifies when new snapshots are needed based on configurable thresholds
 - **Redundant Download Prevention**: Compares remote snapshot slots with local snapshots to avoid unnecessary downloads
-- **RPC Node Selection**: Evaluates and selects the best RPC nodes for downloads based on latency and download speed
+- **Two-Phase Node Evaluation**: Cheap health+HEAD probe on every node, latency shortlist, then byte-capped speed tests on only the closest candidates
+- **Single-Pass Evaluation with Re-Score**: Probes and speed-tests once per run; relaxation attempts only re-classify stored measurements (no re-probe)
+- **Warm-Start Priority**: Reuses prior `nodes_attempt_*.json` results to probe known-good peers first when enough cached nodes exist
+- **Download Cooldown & Retry-After**: Failed or rate-limited hosts are excluded for the rest of the run; HTTP 429 responses honor `Retry-After` before the next attempt
+- **Strict Incremental Validation**: Incremental base slots older than the local full are removed and fail the attempt; bases ahead of the local full are kept as safety incrementals (for download-before-full)
 - **Automated Cleanup**: Removes outdated snapshots to save disk space while maintaining necessary backups
 - **Full & Incremental Support**: Handles both full and incremental snapshots with proper slot validation
 - **Adaptive Retry Logic**: Gradually relaxes speed and latency requirements on retry attempts to ensure snapshot acquisition
-- **Fast RPC Filtering**: Pre-validates snapshot availability with quick HEAD requests before speed testing
-- **Download Retry Logic**: Automatically retries failed downloads with cleanup and fallback
+- **Download Retry Logic**: Automatically retries failed downloads with cleanup and fallback to the next-best node
 
 ## Configuration
 
-The tool uses a YAML configuration file with the following parameters:
+The tool uses a YAML configuration file. See `pkg/config/config.yaml.example` for a full example.
 
 ```yaml
-rpc_address: "https://api.mainnet-beta.solana.com"  # Default RPC if no better nodes found
-snapshot_path: "./snapshots"                        # Base directory to store snapshots
+rpc_address: "https://api.mainnet-beta.solana.com"
+snapshot_path: "./snapshots"
 min_download_speed: 100                             # Minimum acceptable download speed (MB/s)
 max_latency: 200                                    # Maximum acceptable latency (ms)
-num_of_retries: 3                                   # Number of download retry attempts
-sleep_before_retry: 5                               # Time between retries (seconds)
-speed_test_seconds: 3                               # Duration of the download speed test per node (seconds)
-denylist: []                                       # RPC nodes to exclude
-private_rpc: false                                  # Whether to use private RPCs
-worker_count: 100                                   # Number of concurrent evaluation workers
-full_threshold: 25000                               # Slots threshold for full snapshot updates
-incremental_threshold: 1000                         # Slots threshold for incremental updates
-# Retry relaxation parameters
+worker_count: 100                                   # Phase A probe concurrency
+speed_test_candidates: 30                           # Latency shortlist size for Phase B
+speed_test_workers: 5                               # Phase B speed-test concurrency (separate from worker_count)
+speed_test_max_bytes: 268435456                     # Byte cap per speed test (256 MiB default)
+speed_test_seconds: 3                               # Max duration of each speed test (seconds)
+warm_start_min_nodes: 3                             # Min cached good/slow nodes before warm-start activates
+full_threshold: 100000                              # Slots threshold for full snapshot updates (Agave 3.x)
+incremental_threshold: 500                          # Slots threshold for incremental updates (local check)
 speed_relaxation_factor: 0.9                        # Factor to reduce speed requirements on retries
 latency_relaxation_factor: 0.9                      # Factor to increase latency tolerance on retries
-max_relaxation_attempts: 3                          # Maximum number of retry attempts with relaxed requirements
+max_relaxation_attempts: 3                          # Maximum re-score attempts with relaxed requirements
 max_download_retries: 3                             # Maximum number of download retry attempts
+sleep_before_retry: 5                               # Time between relaxation attempts (seconds)
+download_incremental_first: true                    # Safety mode: grab matching incremental before full download
 ```
 
 ### Retry Relaxation Example
 
-With the default settings above, the relaxation works as follows:
+Evaluation runs once. If no node meets the initial speed/latency bar, later attempts **re-score** the same measurements with relaxed thresholds — slot requirements stay strict.
 
-**With `speed_relaxation_factor: 0.8` and `latency_relaxation_factor: 0.8`:**
-- **Attempt 1**: Speed ≥ 100 MB/s, Latency ≤ 200ms (original requirements)
-- **Attempt 2**: Speed ≥ 80 MB/s, Latency ≤ 250ms (relaxed: 100×0.8, 200/0.8)
-- **Attempt 3**: Speed ≥ 64 MB/s, Latency ≤ 313ms (relaxed: 100×0.8×0.8, 200/(0.8×0.8))
-- **Attempt 4**: Speed ≥ 51 MB/s, Latency ≤ 391ms (relaxed: 100×0.8×0.8×0.8, 200/(0.8×0.8×0.8))
+With `speed_relaxation_factor: 0.9` and `latency_relaxation_factor: 0.9`:
 
-*Note: The relaxation factors make requirements more permissive - lower speed thresholds and higher latency tolerance.*
+- **Attempt 1**: Speed ≥ 100 MB/s, Latency ≤ 200 ms (original requirements)
+- **Attempt 2**: Speed ≥ 90 MB/s, Latency ≤ 222 ms
+- **Attempt 3**: Speed ≥ 81 MB/s, Latency ≤ 247 ms
 
 ## How It Works
 
-1. **Snapshot Evaluation**:
-   - Checks if existing snapshots are outdated by comparing slot differences
-   - Full snapshots are updated if their slot differs from the reference by more than `full_threshold`
-   - Incremental snapshots are updated if they differ by more than `incremental_threshold`
+The run proceeds through clear phases logged to stdout:
 
-2. **Fast RPC Filtering**:
-   - **Health Check**: Quick 5-second health check on `/health` endpoint
-   - **Snapshot Pre-Validation**: 3-second HEAD request to verify snapshot availability
-   - **Speed Testing**: Only test RPCs that pass both health and snapshot checks
-   - **Result**: Eliminates RPCs that can't help before wasting time on speed tests
+**probe → shortlist → speed-test → select → download**
 
-3. **Download Optimization**:
-   - Downloads directly with a single GET per extension attempt - no separate HEAD
-     pre-check, since the node was already probed during evaluation and an extra
-     request right before the real download risks tripping the node's own rate
-     limiter (429) at the worst possible time
-   - Extracts the filename and slot information from the redirect-resolved URL
-   - For full snapshots, discards the download if it turns out not to be newer
-     than the local snapshot
-   - Rejects downloads under 1MB as likely error/redirect responses rather than
-     real snapshot data
-   - Downloads to a temporary file first, then copies to final location
+1. **Phase A — Probe** (`worker_count` concurrency):
+   - Health check on `/health` (skipped for static whitelist hosts)
+   - HEAD request on full snapshot endpoint to confirm availability and derive full slot from filename when possible
+   - Records latency for each healthy node with a snapshot
 
-4. **RPC Selection**:
-   - Evaluates multiple RPC nodes for performance metrics
-   - Selects the fastest and most reliable RPC node for downloads
-   - Applies progressive relaxation on retry attempts
-   - Falls back to best available node if no ideal candidates found
+2. **Shortlist**:
+   - Sorts survivors by latency
+   - Keeps only the closest `speed_test_candidates` (default 30) for Phase B
 
-5. **Download Retry & Recovery**:
-   - **Automatic retries**: Retries failed downloads up to `max_download_retries` times
-   - **Clean retry**: Removes failed partial downloads before retrying
-   - **Node rotation**: Switches to the next-best evaluated RPC node on failure instead
-     of retrying the same node
-   - **Resilient operation**: Continues working even after download failures
+3. **Phase B — Speed Test** (`speed_test_workers` concurrency, separate from Phase A):
+   - Prefers `Range: bytes=0-(speed_test_max_bytes-1)`; falls back to a capped plain GET on HTTP 200/416 (many Solana RPC hosts ignore Range and answer 200)
+   - Full slot: uses HEAD-derived filename slot when available (no RPC reconcile); otherwise `getHighestSnapshotSlots` / `getSlot`
+   - Incremental slot for evaluation: always from RPC, never from incremental HEAD
+   - Classifies nodes as good, slow, or bad based on speed, latency, and slot thresholds
 
-6. **Adaptive Retry with Relaxed Requirements**:
-   - If no suitable RPC nodes meet initial speed/latency requirements, automatically retries with relaxed criteria
-   - Gradually reduces minimum download speed requirements on each retry attempt (more permissive)
-   - Progressively increases maximum latency tolerance to find acceptable nodes (more permissive)
-   - Ensures snapshot acquisition even under suboptimal network conditions
-   - Configurable relaxation factors allow fine-tuning of retry behavior
+4. **Warm-Start** (before evaluation):
+   - Reads prior `nodes_attempt_*.json` for good/slow nodes
+   - If count ≥ `warm_start_min_nodes`, those addresses are probed first; otherwise warm-start is skipped
+   - Full cluster discovery still runs — cache only affects probe order
+
+5. **Select**:
+   - Runs once after evaluation; relaxation attempts re-score only (no re-probe)
+   - Picks the fastest node classified as "good"; falls back to best slow node if all attempts exhaust
+
+6. **Download**:
+   - No HEAD pre-check before GET (node was already probed; avoids extra 429 risk)
+   - On failure or HTTP 429: host enters cooldown, `Retry-After` is honored before the next attempt, rotation via `SelectNextRPC`
+   - Incremental: base older than local full → remove and fail; base ahead of local full → keep (safety); equal → keep
 
 7. **Snapshot Management**:
-   - Stores snapshots in organized directories (`snapshot_path` and `snapshot_path/remote`)
-   - Maintains temporary and backup files for resilience
+   - Stores snapshots under `snapshot_path` and `snapshot_path/remote`
    - Cleans up old snapshots based on configurable thresholds
+
+## Observed performance (devnet)
+
+Measured on a Blockdaemon devnet RPC node after deploying this branch (`speed_test_workers: 5`, `speed_test_max_bytes: 256 MiB`, `full_threshold: 100000`, `incremental_threshold: 500`):
+
+| Scenario | What happened | Wall time |
+|----------|---------------|-----------|
+| Incremental-only refresh | Local full still within threshold; probed ~20 RPCs, picked ~409 MB/s peer, downloaded ~42 MB incremental | ~15 s end-to-end |
+| Cold start (empty ledger) | Safety incremental → ~50 GB full at ~451 MB/s → fresher incremental | ~2 min (full download ~1m46s) |
+| Restart with fresh locals | Diffs within thresholds → exit without probe/download | &lt; 1 s |
+
+Notes from those runs:
+
+- Warm-start reused prior `nodes_attempt_*.json` (11 cached good/slow peers)
+- Evaluation stayed single-pass (no re-probe on relaxation)
+- Most RPC hosts returned `200 OK` to Range speed tests, so the client fell back to plain GET as designed
 
 ## Usage
 
@@ -116,25 +123,18 @@ When integrated with Solana validator startup, the tool will:
 - Implements progress tracking for large downloads with estimated time remaining
 - Employs regex pattern matching to extract slot information from filenames
 - Maintains backup files to prevent data loss during download operations
-- Performs verification at multiple stages to ensure snapshot integrity
-- **Retry Relaxation Algorithm**: 
-  - On each retry attempt, reduces speed requirements by dividing by `speed_relaxation_factor * attempt_number`
-  - Increases latency tolerance by multiplying by `latency_relaxation_factor * attempt_number`
-  - **Relaxes slot thresholds** to allow older but still usable nodes on retry attempts
-  - Saves evaluation results for each attempt to `nodes_attempt_N.json` files
-  - Continues until suitable nodes are found or maximum attempts are reached
+- Saves evaluation results for each relaxation attempt to `nodes_attempt_N.json` files
 
-- **Slot Validation Logic**:
-  - **Node Evaluation**: Always uses `full_threshold` (default: 25,000 slots) to find nodes capable of providing recent full snapshots
-  - **Local File Check**: Uses `incremental_threshold` (default: 500 slots) only when checking existing local snapshots
-  - **Smart Workflow**: First finds nodes with good full snapshots, then determines if incremental is needed based on local state
-  - **Strict requirement**: Slot difference must be within full threshold during node evaluation (no relaxation)
-  - Prioritizes nodes with closest slot to reference for most recent snapshots
-  - Logs slot validation decisions for transparency and debugging
+### Slot Validation Logic
+
+- **Node Evaluation**: Always uses `full_threshold` to find nodes capable of providing recent full snapshots (no relaxation)
+- **Local File Check**: Uses `incremental_threshold` only when checking existing local snapshots
+- **HEAD vs RPC**: When Phase A HEAD exposes a full snapshot filename, that slot wins at selection time without an RPC cross-check; post-download filename checks remain the correctness backstop
 
 ## Best Practices
 
 - Adjust thresholds based on your network's slot advancement rate and restart frequency
+- Lower `speed_test_max_bytes` or `speed_test_candidates` if probe bandwidth is still too high
 - Use a dedicated disk with sufficient space for snapshots (95GB+ for full snapshots)
 
-This tool significantly improves Solana validator startup times by intelligently managing snapshots and preventing redundant downloads of large files. 
+This tool significantly improves Solana validator startup times by intelligently managing snapshots and preventing redundant downloads of large files.

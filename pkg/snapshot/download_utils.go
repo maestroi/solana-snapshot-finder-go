@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,7 +13,36 @@ import (
 	"time"
 
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
+	"github.com/maestroi/solana-snapshot-finder-go/pkg/rpc"
 )
+
+type HTTPStatusError struct {
+	StatusCode int
+	RetryAfter time.Duration
+	URL        string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("snapshot request returned status %d for %s", e.StatusCode, e.URL)
+}
+
+// ValidationError indicates the downloaded file itself failed a content check
+// (e.g. slot mismatch) rather than a transport/HTTP failure. Callers should
+// not treat the source host as permanently bad for this - it may just have
+// served a snapshot that's stale relative to what we already have locally.
+type ValidationError struct {
+	msg string
+}
+
+func (e *ValidationError) Error() string {
+	return e.msg
+}
+
+// NewValidationError constructs a ValidationError for callers/tests outside
+// this package that need to simulate a content-validation failure.
+func NewValidationError(msg string) *ValidationError {
+	return &ValidationError{msg: msg}
+}
 
 type ProgressWriter struct {
 	TotalBytes   int64
@@ -61,10 +91,31 @@ func DownloadGenesis(rpcAddress, snapshotPath string) error {
 	genesisURL := fmt.Sprintf("%s/genesis.tar.bz2", rpcAddress)
 	_, _, err := writeSnapshotToFile(genesisURL, tmpDir, snapshotPath, true)
 	if err != nil {
-		return fmt.Errorf("failed to download genesis snapshot: %v", err)
+		return fmt.Errorf("failed to download genesis snapshot: %w", err)
 	}
 
 	return nil
+}
+
+// copyFile is the fallback path for the rare case tmp and dst live on different
+// filesystems (os.Rename returns EXDEV), so it can't just be a rename.
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open temp file for copying: %v", err)
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %v", err)
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return fmt.Errorf("failed to copy file to final location: %v", err)
+	}
+	return dstFile.Sync()
 }
 
 func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (string, int64, error) {
@@ -82,13 +133,29 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("snapshot request returned status %d for %s", resp.StatusCode, snapshotURL)
+		retryAfter, _ := rpc.ParseRetryAfter(resp.Header, time.Now())
+		return "", 0, &HTTPStatusError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: retryAfter,
+			URL:        snapshotURL,
+		}
+	}
+
+	// Abort early if Content-Length says we don't have enough free space
+	if resp.ContentLength > 0 {
+		ok, err := CheckDiskSpaceForDownload(baseDir, uint64(resp.ContentLength))
+		if err != nil {
+			log.Printf("Warning: Could not verify disk space: %v", err)
+		} else if !ok {
+			return "", 0, fmt.Errorf("insufficient disk space for download of %s", FormatBytes(uint64(resp.ContentLength)))
+		}
 	}
 
 	// Get the final URL after redirects
 	finalURL := resp.Request.URL.String()
 	fileName := filepath.Base(finalURL)
-	log.Printf("Original filename from URL: %s", fileName)
+	log.Printf("Original final URL: %s", finalURL)
+	log.Printf("Original filename from final URL: %s", fileName)
 
 	if fileName == "" {
 		return "", 0, fmt.Errorf("invalid file name parsed from URL: %s", finalURL)
@@ -150,36 +217,16 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 		return "", 0, fmt.Errorf("downloaded file is too small (%d bytes), likely an error response", totalBytes)
 	}
 
-	// Copy from temporary to final location
-	srcFile, err := os.Open(tmpFilePath)
-	if err != nil {
-		log.Printf("Error opening temp file: %v", err)
-		return "", 0, fmt.Errorf("failed to open temp file for copying: %v", err)
+	// Move into place. Rename is instant (same filesystem, both under snapshotPath) -
+	// avoids reading and writing the whole multi-GB file a second time.
+	if err := os.Rename(tmpFilePath, finalFilePath); err != nil {
+		log.Printf("Rename failed (%v), falling back to copy", err)
+		if err := copyFile(tmpFilePath, finalFilePath); err != nil {
+			return "", 0, err
+		}
+		os.Remove(tmpFilePath)
 	}
-	defer srcFile.Close()
-
-	// Create the destination file with explicit permissions
-	dstFile, err := os.OpenFile(finalFilePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		log.Printf("Error creating destination file: %v", err)
-		return "", 0, fmt.Errorf("failed to create destination file: %v", err)
-	}
-	defer dstFile.Close()
-
-	// Copy the file contents
-	copiedBytes, err := io.Copy(dstFile, srcFile)
-	if err != nil {
-		log.Printf("Error copying file: %v", err)
-		return "", 0, fmt.Errorf("failed to copy file to final location: %v", err)
-	}
-	log.Printf("Copied %d bytes to final location: %s", copiedBytes, finalFilePath)
-
-	// Sync the file to disk
-	if err = dstFile.Sync(); err != nil {
-		log.Printf("Warning: Failed to sync file to disk: %v", err)
-	}
-
-	os.Remove(tmpFilePath)
+	log.Printf("Moved to final location: %s", finalFilePath)
 
 	// Verify the final file exists
 	if _, err := os.Stat(finalFilePath); err != nil {
@@ -191,6 +238,43 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 	speed := float64(totalBytes) / 1024 / 1024 / time.Since(pw.StartTime).Seconds()
 	log.Printf("Download completed: %s | Speed: %.2f MB/s", finalFilePath, speed)
 	return finalFilePath, totalBytes, nil
+}
+
+func validateDownloadedIncremental(cfg config.Config, finalPath string, referenceSlot int) error {
+	slotStart, slotEnd, err := ExtractIncrementalSnapshotSlots(finalPath)
+	if err != nil {
+		log.Printf("Warning: Failed to extract slots from incremental snapshot: %v", err)
+		return nil
+	}
+
+	if referenceSlot-slotEnd > cfg.IncrementalThreshold {
+		log.Printf("Warning: Incremental snapshot might be old, but keeping it anyway")
+	}
+
+	_, fullSlot, err := findRecentFullSnapshot(cfg.SnapshotPath, referenceSlot, 0)
+	if err != nil {
+		log.Printf("Warning: Could not find full snapshot: %v", err)
+		return nil
+	}
+
+	// The incremental is only unusable if it's older than the full snapshot we
+	// already have on disk (its base predates our base, so it can't apply cleanly).
+	// If it's ahead of - or equal to - our local full, it's either a match or a
+	// legitimate "safety" incremental fetched before a newer full snapshot landed
+	// (the local full is stale at comparison time but the safety incremental's
+	// base matches the *remote* full that's still downloading). Keep it either way.
+	if slotStart < fullSlot {
+		log.Printf("Incremental base slot %d is older than local full snapshot slot %d — removing and failing attempt", slotStart, fullSlot)
+		_ = os.Remove(finalPath)
+		return &ValidationError{msg: fmt.Sprintf("incremental base slot %d < full slot %d", slotStart, fullSlot)}
+	}
+
+	if slotStart > fullSlot {
+		log.Printf("Incremental base slot %d is ahead of local full snapshot slot %d — keeping as safety incremental", slotStart, fullSlot)
+		return nil
+	}
+
+	return nil
 }
 
 func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string, referenceSlot int) error {
@@ -227,6 +311,11 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 	var sizeBytes int64
 	downloadErr := fmt.Errorf("no extension returned HTTP 200 from %s", rpcAddress)
 
+	rpcBase := strings.TrimRight(rpcAddress, "/")
+	if !strings.HasPrefix(rpcBase, "http://") && !strings.HasPrefix(rpcBase, "https://") {
+		rpcBase = "http://" + rpcBase
+	}
+
 	// NOTE: no HEAD pre-check here. The node was already probed (health, snapshot
 	// availability, speed) during evaluation, so an extra HEAD right before the
 	// real download just doubles our request rate against the same IP and risks
@@ -235,15 +324,19 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 	for _, ext := range extensions {
 		var snapshotURL string
 		if strings.HasPrefix(snapshotType, "incremental") {
-			snapshotURL = fmt.Sprintf("%s/incremental-snapshot%s", rpcAddress, ext)
+			snapshotURL = fmt.Sprintf("%s/incremental-snapshot%s", rpcBase, ext)
 		} else {
-			snapshotURL = fmt.Sprintf("%s/snapshot%s", rpcAddress, ext)
+			snapshotURL = fmt.Sprintf("%s/snapshot%s", rpcBase, ext)
 		}
 		log.Printf("Trying URL: %s", snapshotURL)
 
 		finalPath, sizeBytes, downloadErr = writeSnapshotToFile(snapshotURL, tmpDir, cfg.SnapshotPath, false)
 		if downloadErr != nil {
 			log.Printf("Failed to download with %s extension: %v", ext, downloadErr)
+			var statusErr *HTTPStatusError
+			if errors.As(downloadErr, &statusErr) && statusErr.StatusCode == http.StatusTooManyRequests {
+				return fmt.Errorf("failed to download snapshot: %w", downloadErr)
+			}
 			continue
 		}
 
@@ -257,7 +350,14 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 				downloadErr = err
 				continue
 			}
-			if existingSlot > 0 && remoteSlot <= existingSlot {
+			if cfg.MaxSlot > 0 {
+				if int64(remoteSlot) > cfg.MaxSlot {
+					log.Printf("Remote snapshot (slot %d) exceeds max_slot %d. Discarding.", remoteSlot, cfg.MaxSlot)
+					os.Remove(finalPath)
+					downloadErr = fmt.Errorf("remote snapshot slot %d exceeds max_slot %d", remoteSlot, cfg.MaxSlot)
+					continue
+				}
+			} else if existingSlot > 0 && remoteSlot <= existingSlot {
 				log.Printf("Remote snapshot (slot %d) is not newer than existing snapshot (slot %d). Discarding.",
 					remoteSlot, existingSlot)
 				os.Remove(finalPath)
@@ -270,7 +370,7 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 	}
 
 	if downloadErr != nil {
-		return fmt.Errorf("failed to download snapshot with any extension: %v", downloadErr)
+		return fmt.Errorf("failed to download snapshot with any extension: %w", downloadErr)
 	}
 
 	// Verify the file exists in the remote directory
@@ -288,7 +388,16 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 		}
 
 		// Double-check that downloaded slot matches what we expected
-		if existingSlot > 0 && downloadedSlot <= existingSlot {
+		if cfg.MaxSlot > 0 {
+			if int64(downloadedSlot) > cfg.MaxSlot {
+				log.Printf("Warning: Downloaded snapshot (slot %d) exceeds max_slot %d. Removing.",
+					downloadedSlot, cfg.MaxSlot)
+				if err := os.Remove(finalPath); err != nil {
+					log.Printf("Warning: Failed to remove out-of-range downloaded snapshot: %v", err)
+				}
+				return fmt.Errorf("downloaded snapshot slot %d exceeds max_slot %d", downloadedSlot, cfg.MaxSlot)
+			}
+		} else if existingSlot > 0 && downloadedSlot <= existingSlot {
 			log.Printf("Warning: Downloaded snapshot (slot %d) is not newer than existing snapshot (slot %d). Removing redundant download.",
 				downloadedSlot, existingSlot)
 			// Remove the downloaded file since it's not newer
@@ -298,28 +407,12 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 			return nil
 		}
 
-		if downloadedSlot < referenceSlot-cfg.FullThreshold {
+		if cfg.MaxSlot <= 0 && downloadedSlot < referenceSlot-cfg.FullThreshold {
 			log.Printf("Warning: Downloaded snapshot might be old, but keeping it anyway")
 		}
 	} else {
-		slotStart, slotEnd, err := ExtractIncrementalSnapshotSlots(finalPath)
-		if err != nil {
-			log.Printf("Warning: Failed to extract slots from incremental snapshot: %v", err)
-			return nil
-		}
-
-		if referenceSlot-slotEnd > cfg.IncrementalThreshold {
-			log.Printf("Warning: Incremental snapshot might be old, but keeping it anyway")
-		}
-
-		_, fullSlot, err := findRecentFullSnapshot(cfg.SnapshotPath, referenceSlot, 0)
-		if err != nil {
-			log.Printf("Warning: Could not find full snapshot: %v", err)
-			return nil
-		}
-
-		if slotStart != fullSlot {
-			log.Printf("Warning: Incremental snapshot might not match full snapshot, but keeping it anyway")
+		if err := validateDownloadedIncremental(cfg, finalPath, referenceSlot); err != nil {
+			return err
 		}
 	}
 

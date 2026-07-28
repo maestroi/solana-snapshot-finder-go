@@ -1,4 +1,10 @@
 rpc_address: "https://api.mainnet-beta.solana.com"
+# Optional: try multiple RPC endpoints in order for cluster/slot lookups,
+# falling back to the next one if an endpoint is down or rate-limited.
+# If set, this takes precedence over rpc_address.
+# rpc_addresses:
+#   - "https://api.mainnet-beta.solana.com"
+#   - "https://solana-rpc.publicnode.com"
 snapshot_path: "./snapshots"
 min_download_speed: 100
 max_latency: 200
@@ -6,12 +12,40 @@ num_of_retries: 5
 sleep_before_retry: 5
 private_rpc: false
 worker_count: 100
-full_threshold: 100000
+full_threshold: 100000            # Agave 3.x: ~100k slots after full
 incremental_threshold: 500
+# How many latency-shortlisted candidates get a real speed test per attempt.
+# Keep this small - it's the only phase that pulls real bandwidth from other nodes.
+speed_test_candidates: 30
+speed_test_seconds: 3
+# Phase B speed-test concurrency (separate from worker_count / Phase A probes).
+speed_test_workers: 5
+# Max bytes read during a speed test (256 MiB default).
+speed_test_max_bytes: 268435456
+# Minimum cached good/slow nodes before warm-start activates.
+warm_start_min_nodes: 3
 speed_relaxation_factor: 0.9
 latency_relaxation_factor: 0.9
 max_relaxation_attempts: 3
 max_download_retries: 3
+
+# Preferred snapshot sources (RPC endpoints or static HTTP URLs ending with /)
+# whitelist:
+#   - "https://snapshots.example.com/mainnet-beta/"
+#   - "http://custom-node:8899"
+whitelist: []
+whitelist_mode: "additional"      # "only", "additional", or "disabled"
+
+# Download a matching incremental before the full snapshot so a usable
+# incremental exists if the full download outlives the expiry window.
+download_incremental_first: true
+
+# Keep at most N full snapshots in snapshot_path (0 = unlimited)
+max_full_snapshots: 2
+
+# Find newest snapshot with slot <= this value (0 = disabled, find latest)
+# max_slot: 0
+
 denylist:
   - "192.168.1.100"
   - "10.0.0.5"
