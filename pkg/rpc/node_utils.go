@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,7 +22,19 @@ import (
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 )
 
-var incrementalFilenameRe = regexp.MustCompile(`incremental-snapshot-(\d+)-(\d+)-[a-zA-Z0-9]+\.tar\.(zst|bz2)`)
+var (
+	fullSnapshotFilenameRe = regexp.MustCompile(`^snapshot-(\d+)-[a-zA-Z0-9]+\.tar\.(zst|bz2)$`)
+	incrementalFilenameRe  = regexp.MustCompile(`incremental-snapshot-(\d+)-(\d+)-[a-zA-Z0-9]+\.tar\.(zst|bz2)`)
+)
+
+func parseFullSnapshotSlotFromName(name string) (int, bool) {
+	match := fullSnapshotFilenameRe.FindStringSubmatch(name)
+	if match == nil {
+		return 0, false
+	}
+	slot, err := strconv.Atoi(match[1])
+	return slot, err == nil && slot > 0
+}
 
 // IncrementalInfo describes a probed incremental snapshot on a node.
 type IncrementalInfo struct {
@@ -232,8 +245,9 @@ func checkHealth(rpc string) bool {
 }
 
 // checkSnapshotAvailability returns the extension that responded so the speed
-// test hits the same URL that was just confirmed available.
-func checkSnapshotAvailability(rpc string) (bool, string) {
+// test hits the same URL that was just confirmed available, plus the full slot
+// when the response filename exposes it.
+func checkSnapshotAvailability(rpc string) (bool, string, int) {
 	client := &http.Client{Timeout: 3 * time.Second}
 	base := normalizeRPCBase(rpc)
 	extensions := []string{".tar.bz2", ".tar.zst"}
@@ -241,22 +255,28 @@ func checkSnapshotAvailability(rpc string) (bool, string) {
 		snapshotURL := base + "/snapshot" + ext
 		resp, err := client.Head(snapshotURL)
 		if err == nil && resp.StatusCode == http.StatusOK {
+			fileName := filepath.Base(resp.Request.URL.Path)
+			if _, params, parseErr := mime.ParseMediaType(resp.Header.Get("Content-Disposition")); parseErr == nil && params["filename"] != "" {
+				fileName = filepath.Base(params["filename"])
+			}
+			fullSlot, _ := parseFullSnapshotSlotFromName(fileName)
 			resp.Body.Close()
-			return true, ext
+			return true, ext, fullSlot
 		}
 		if resp != nil {
 			resp.Body.Close()
 		}
 	}
-	return false, ""
+	return false, "", 0
 }
 
 // probeCandidate is a node that passed the cheap health+availability check.
 type probeCandidate struct {
-	node    RPCNode
-	rpc     string
-	ext     string
-	latency float64
+	node     RPCNode
+	rpc      string
+	ext      string
+	fullSlot int
+	latency  float64
 }
 
 func speedTestWorkerCount(cfg config.Config) int {
@@ -307,7 +327,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			}
 			latency := float64(time.Since(start).Milliseconds())
 
-			available, ext := checkSnapshotAvailability(rpc)
+			available, ext, fullSlot := checkSnapshotAvailability(rpc)
 			if !available {
 				atomic.AddInt32(&snapshotUnavailableNodes, 1)
 				addBad(node, rpc)
@@ -315,7 +335,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			}
 
 			candMu.Lock()
-			candidates = append(candidates, probeCandidate{node: node, rpc: rpc, ext: ext, latency: latency})
+			candidates = append(candidates, probeCandidate{node: node, rpc: rpc, ext: ext, fullSlot: fullSlot, latency: latency})
 			candMu.Unlock()
 		}(node)
 	}
@@ -374,6 +394,13 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 				slot = defaultSlot
 				fullSlot = defaultSlot
 				incrementalSlot = defaultSlot
+			} else if c.fullSlot > 0 {
+				fullSlot = c.fullSlot
+				slot = fullSlot
+				log.Printf("Node %s: full slot %d from HEAD filename (selection-time; no RPC reconcile)", c.rpc, fullSlot)
+				if slots, err := GetHighestSnapshotSlots(c.rpc); err == nil {
+					incrementalSlot = slots.Incremental
+				}
 			} else if slots, err := GetHighestSnapshotSlots(c.rpc); err == nil {
 				fullSlot = slots.Full
 				incrementalSlot = slots.Incremental

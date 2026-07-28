@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -10,6 +11,86 @@ import (
 
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 )
+
+func TestParseFullSnapshotSlotFromName(t *testing.T) {
+	slot, ok := parseFullSnapshotSlotFromName("snapshot-12345-AbCdEf.tar.zst")
+	if !ok || slot != 12345 {
+		t.Fatalf("got %d %v", slot, ok)
+	}
+	if _, ok := parseFullSnapshotSlotFromName("incremental-snapshot-1-2-x.tar.zst"); ok {
+		t.Fatal("incremental name must not parse as full")
+	}
+}
+
+func TestCheckSnapshotAvailabilityReturnsSlotFromRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/snapshot.tar.bz2" {
+			http.Redirect(w, r, "/snapshot-12345-AbCdEf.tar.zst", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	available, ext, fullSlot := checkSnapshotAvailability(srv.URL)
+	if !available || ext != ".tar.bz2" || fullSlot != 12345 {
+		t.Fatalf("got available=%v ext=%q fullSlot=%d", available, ext, fullSlot)
+	}
+}
+
+func TestEvaluateNodesUsesHeadFullSlotAndRPCIncrementalSlot(t *testing.T) {
+	var snapshotSlotCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/snapshot.tar.bz2":
+			http.Redirect(w, r, "/snapshot-12345-AbCdEf.tar.zst", http.StatusFound)
+		case r.URL.Path == "/snapshot-12345-AbCdEf.tar.zst":
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusPartialContent)
+				w.Write(bytes.Repeat([]byte("x"), 1024))
+			}
+		case r.Method == http.MethodPost:
+			snapshotSlotCalls.Add(1)
+			json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"result":  map[string]int{"full": 99999, "incremental": 12399},
+				"id":      1,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	results := EvaluateNodesWithVersions([]RPCNode{{Address: srv.URL}}, config.Config{
+		WorkerCount:          1,
+		SpeedTestWorkers:     1,
+		SpeedTestCandidates:  1,
+		SpeedTestSeconds:     1,
+		SpeedTestMaxBytes:    1024,
+		FullThreshold:        1000,
+		MaxLatency:           10000,
+		MinDownloadSpeed:     0,
+		IncrementalThreshold: 1000,
+	}, 12400)
+
+	if len(results) != 1 {
+		t.Fatalf("got %d results", len(results))
+	}
+	if results[0].FullSlot != 12345 || results[0].Slot != 12345 {
+		t.Fatalf("HEAD full slot must win, got full=%d slot=%d", results[0].FullSlot, results[0].Slot)
+	}
+	if results[0].IncrementalSlot != 12399 {
+		t.Fatalf("expected RPC incremental slot 12399, got %d", results[0].IncrementalSlot)
+	}
+	if snapshotSlotCalls.Load() != 1 {
+		t.Fatalf("expected one RPC call for incremental slot, got %d", snapshotSlotCalls.Load())
+	}
+}
 
 func TestSpeedTestWorkerClamp(t *testing.T) {
 	if got := speedTestWorkerCount(config.Config{SpeedTestWorkers: 0}); got != 5 {
