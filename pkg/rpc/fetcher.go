@@ -22,7 +22,22 @@ type RPCNode struct {
 	Version string
 }
 
-func GetRPCNodes(rpcAddress string, retries int, denylist []string, privateRPC bool) ([]RPCNode, []string, error) {
+// tryEndpoints calls fn with each endpoint in order, returning the first success.
+// Used so a single down/rate-limited RPC endpoint doesn't fail the whole run.
+func tryEndpoints[T any](endpoints []string, fn func(string) (T, error)) (T, error) {
+	var zero, result T
+	var err error
+	for _, endpoint := range endpoints {
+		result, err = fn(endpoint)
+		if err == nil {
+			return result, nil
+		}
+		log.Printf("Endpoint %s failed: %v", endpoint, err)
+	}
+	return zero, err
+}
+
+func GetRPCNodes(rpcAddress string, denylist []string, privateRPC bool) ([]RPCNode, []string, error) {
 	// Log denylist configuration if any IPs are specified
 	if len(denylist) > 0 {
 		log.Printf("Denylist configured with %d IPs: %v", len(denylist), denylist)
@@ -41,16 +56,9 @@ func GetRPCNodes(rpcAddress string, retries int, denylist []string, privateRPC b
 
 	client := &http.Client{Timeout: 15 * time.Second} // Adjust timeout as needed
 
-	var resp *http.Response
-	for attempt := 1; attempt <= retries; attempt++ {
-		resp, err = client.Do(req)
-		if err == nil {
-			break
-		}
-		time.Sleep(2 * time.Second) // Add delay between retries
-	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to fetch RPC nodes after %d retries: %v", retries, err)
+		return nil, nil, fmt.Errorf("failed to fetch RPC nodes: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -179,6 +187,11 @@ func GetReferenceSlot(rpcAddress string) (int, error) {
 	return result.Result, nil
 }
 
+// GetReferenceSlotFromAny tries each endpoint in order, returning the first successful slot.
+func GetReferenceSlotFromAny(endpoints []string) (int, error) {
+	return tryEndpoints(endpoints, GetReferenceSlot)
+}
+
 // SnapshotSlots represents the response from getHighestSnapshotSlot
 type SnapshotSlots struct {
 	Full        int `json:"full"`
@@ -229,13 +242,22 @@ func GetHighestSnapshotSlots(rpcAddress string) (SnapshotSlots, error) {
 	return result.Result, nil
 }
 
-// FetchRPCNodes fetches RPC nodes
+// GetHighestSnapshotSlotsFromAny tries each endpoint in order, returning the first successful result.
+func GetHighestSnapshotSlotsFromAny(endpoints []string) (SnapshotSlots, error) {
+	return tryEndpoints(endpoints, GetHighestSnapshotSlots)
+}
+
+// FetchRPCNodes fetches RPC nodes, trying each configured endpoint on every attempt.
 func FetchRPCNodes(cfg config.Config) []RPCNode {
+	endpoints := cfg.RPCEndpoints()
 	var nodes []RPCNode
 	var err error
 
 	for attempt := 1; attempt <= cfg.NumOfRetries; attempt++ {
-		nodes, _, err = GetRPCNodes(cfg.RPCAddress, cfg.NumOfRetries, cfg.Denylist, cfg.PrivateRPC)
+		nodes, err = tryEndpoints(endpoints, func(addr string) ([]RPCNode, error) {
+			nodes, _, err := GetRPCNodes(addr, cfg.Denylist, cfg.PrivateRPC)
+			return nodes, err
+		})
 		if err == nil && len(nodes) > 0 {
 			log.Printf("Fetched %d RPC nodes on attempt %d.", len(nodes), attempt)
 			return nodes

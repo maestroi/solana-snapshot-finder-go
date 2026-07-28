@@ -4,6 +4,7 @@ import "github.com/spf13/viper"
 
 type Config struct {
 	RPCAddress           string   `mapstructure:"rpc_address"`
+	RPCAddresses         []string `mapstructure:"rpc_addresses"`
 	SnapshotPath         string   `mapstructure:"snapshot_path"`
 	MinDownloadSpeed     int      `mapstructure:"min_download_speed"`
 	MaxLatency           int      `mapstructure:"max_latency"`
@@ -14,6 +15,7 @@ type Config struct {
 	WorkerCount          int      `mapstructure:"worker_count"`
 	FullThreshold        int      `mapstructure:"full_threshold"` // New: Full snapshot threshold
 	IncrementalThreshold int      `mapstructure:"incremental_threshold"`
+	SpeedTestCandidates  int      `mapstructure:"speed_test_candidates"`
 	// Retry relaxation parameters
 	SpeedRelaxationFactor   float64 `mapstructure:"speed_relaxation_factor"`
 	LatencyRelaxationFactor float64 `mapstructure:"latency_relaxation_factor"`
@@ -43,6 +45,7 @@ func LoadConfig(configPath string) (Config, error) {
 	viper.SetDefault("worker_count", 100)
 	viper.SetDefault("full_threshold", 25000)
 	viper.SetDefault("incremental_threshold", 1000)
+	viper.SetDefault("speed_test_candidates", 30)
 	viper.SetDefault("speed_relaxation_factor", 0.9)
 	viper.SetDefault("latency_relaxation_factor", 0.9)
 	viper.SetDefault("max_relaxation_attempts", 3)
@@ -61,4 +64,13 @@ func LoadConfig(configPath string) (Config, error) {
 	}
 
 	return config, nil
+}
+
+// RPCEndpoints returns the configured RPC addresses to try in order,
+// falling back to the single legacy rpc_address if rpc_addresses is unset.
+func (c Config) RPCEndpoints() []string {
+	if len(c.RPCAddresses) > 0 {
+		return c.RPCAddresses
+	}
+	return []string{c.RPCAddress}
 }

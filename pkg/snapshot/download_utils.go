@@ -67,6 +67,27 @@ func DownloadGenesis(rpcAddress, snapshotPath string) error {
 	return nil
 }
 
+// copyFile is the fallback path for the rare case tmp and dst live on different
+// filesystems (os.Rename returns EXDEV), so it can't just be a rename.
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open temp file for copying: %v", err)
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %v", err)
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return fmt.Errorf("failed to copy file to final location: %v", err)
+	}
+	return dstFile.Sync()
+}
+
 func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (string, int64, error) {
 	// Ensure the temporary directory exists
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
@@ -150,36 +171,16 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 		return "", 0, fmt.Errorf("downloaded file is too small (%d bytes), likely an error response", totalBytes)
 	}
 
-	// Copy from temporary to final location
-	srcFile, err := os.Open(tmpFilePath)
-	if err != nil {
-		log.Printf("Error opening temp file: %v", err)
-		return "", 0, fmt.Errorf("failed to open temp file for copying: %v", err)
+	// Move into place. Rename is instant (same filesystem, both under snapshotPath) -
+	// avoids reading and writing the whole multi-GB file a second time.
+	if err := os.Rename(tmpFilePath, finalFilePath); err != nil {
+		log.Printf("Rename failed (%v), falling back to copy", err)
+		if err := copyFile(tmpFilePath, finalFilePath); err != nil {
+			return "", 0, err
+		}
+		os.Remove(tmpFilePath)
 	}
-	defer srcFile.Close()
-
-	// Create the destination file with explicit permissions
-	dstFile, err := os.OpenFile(finalFilePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		log.Printf("Error creating destination file: %v", err)
-		return "", 0, fmt.Errorf("failed to create destination file: %v", err)
-	}
-	defer dstFile.Close()
-
-	// Copy the file contents
-	copiedBytes, err := io.Copy(dstFile, srcFile)
-	if err != nil {
-		log.Printf("Error copying file: %v", err)
-		return "", 0, fmt.Errorf("failed to copy file to final location: %v", err)
-	}
-	log.Printf("Copied %d bytes to final location: %s", copiedBytes, finalFilePath)
-
-	// Sync the file to disk
-	if err = dstFile.Sync(); err != nil {
-		log.Printf("Warning: Failed to sync file to disk: %v", err)
-	}
-
-	os.Remove(tmpFilePath)
+	log.Printf("Moved to final location: %s", finalFilePath)
 
 	// Verify the final file exists
 	if _, err := os.Stat(finalFilePath); err != nil {

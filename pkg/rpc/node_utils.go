@@ -89,106 +89,64 @@ func calculateMedian(values []float64) float64 {
 	return values[n/2]
 }
 
-func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot int) []NodeEvaluationResult {
-	var wg sync.WaitGroup
-	results := make(chan NodeEvaluationResult, len(nodes))
-	done := make(chan bool)
+func checkHealth(rpc string) bool {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(rpc + "/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
 
-	// Create a semaphore to limit concurrent goroutines
+// checkSnapshotAvailability returns the extension that responded so the speed
+// test hits the same URL that was just confirmed available.
+func checkSnapshotAvailability(rpc string) (bool, string) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	extensions := []string{".tar.bz2", ".tar.zst"}
+	for _, ext := range extensions {
+		snapshotURL := rpc + "/snapshot" + ext
+		resp, err := client.Head(snapshotURL)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
+			return true, ext
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+	return false, ""
+}
+
+// probeCandidate is a node that passed the cheap health+availability check.
+type probeCandidate struct {
+	node    RPCNode
+	rpc     string
+	ext     string
+	latency float64
+}
+
+// EvaluateNodesWithVersions evaluates cluster nodes in two phases: a cheap
+// health+availability+latency probe against every node, then a real
+// bandwidth speed test against only the closest cfg.SpeedTestCandidates of
+// those - instead of pulling real snapshot bytes from every node in the
+// cluster (which can be thousands), keeping load on the network low.
+func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot int) []NodeEvaluationResult {
 	sem := make(chan struct{}, cfg.WorkerCount)
 
-	var processedNodes int32
-	var goodNodes int32
-	var slowNodes int32
-	var badNodes int32
-	var healthFailedNodes int32
-	var snapshotUnavailableNodes int32
-
-	ticker := time.NewTicker(5 * time.Second)
-
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				processed := atomic.LoadInt32(&processedNodes)
-				good := atomic.LoadInt32(&goodNodes)
-				slow := atomic.LoadInt32(&slowNodes)
-				bad := atomic.LoadInt32(&badNodes)
-				healthFailed := atomic.LoadInt32(&healthFailedNodes)
-				snapshotUnavailable := atomic.LoadInt32(&snapshotUnavailableNodes)
-				log.Printf("Progress: %d/%d nodes processed (%.1f%%) | Good: %d, Slow: %d, Bad: %d | Health Failed: %d, No Snapshot: %d",
-					processed, len(nodes), float64(processed)/float64(len(nodes))*100, good, slow, bad, healthFailed, snapshotUnavailable)
-			case <-done:
-				ticker.Stop()
-				return
-			}
-		}
-	}()
-
-	appendResult := func(node RPCNode, rpc string, speed, latency float64, slot, fullSlot, incrementalSlot, diff int, status string) {
-		results <- NodeEvaluationResult{
-			RPC:             rpc,
-			Speed:           speed,
-			Latency:         latency,
-			Slot:            slot,
-			FullSlot:        fullSlot,
-			IncrementalSlot: incrementalSlot,
-			Diff:            diff,
-			Version:         node.Version,
-			Status:          status,
-		}
-
-		processed := atomic.AddInt32(&processedNodes, 1)
-		switch status {
-		case "good":
-			atomic.AddInt32(&goodNodes, 1)
-		case "slow":
-			atomic.AddInt32(&slowNodes, 1)
-		case "bad":
-			atomic.AddInt32(&badNodes, 1)
-		}
-
-		if processed%50 == 0 {
-			log.Printf("Milestone reached: %d/%d nodes processed", processed, len(nodes))
-		}
+	var healthFailedNodes, snapshotUnavailableNodes int32
+	var badResults []NodeEvaluationResult
+	var badMu sync.Mutex
+	addBad := func(node RPCNode, rpc string) {
+		badMu.Lock()
+		badResults = append(badResults, NodeEvaluationResult{RPC: rpc, Version: node.Version, Status: "bad"})
+		badMu.Unlock()
 	}
 
-	checkHealth := func(rpc string) bool {
-		client := &http.Client{
-			Timeout: 5 * time.Second,
-		}
-		resp, err := client.Get(rpc + "/health")
-		if err != nil {
-			return false
-		}
-		defer resp.Body.Close()
-		return resp.StatusCode == http.StatusOK
-	}
-
-	// NEW: Check if snapshot is actually available before speed testing.
-	// Returns the extension that responded so the speed test hits the same
-	// URL that was just confirmed available, instead of assuming .tar.bz2.
-	checkSnapshotAvailability := func(rpc string) (bool, string) {
-		client := &http.Client{
-			Timeout: 3 * time.Second, // Quick check for snapshot availability
-		}
-
-		// Try both common snapshot extensions
-		extensions := []string{".tar.bz2", ".tar.zst"}
-		for _, ext := range extensions {
-			snapshotURL := rpc + "/snapshot" + ext
-			resp, err := client.Head(snapshotURL)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				resp.Body.Close()
-				return true, ext
-			}
-			if resp != nil {
-				resp.Body.Close()
-			}
-		}
-		return false, ""
-	}
-
+	// Phase A: cheap probe (health + snapshot availability + latency) on every node.
+	var candMu sync.Mutex
+	var candidates []probeCandidate
+	var wg sync.WaitGroup
 	for _, node := range nodes {
 		wg.Add(1)
 		go func(node RPCNode) {
@@ -201,47 +159,86 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 				rpc = "http://" + rpc
 			}
 
+			start := time.Now()
 			if !checkHealth(rpc) {
 				atomic.AddInt32(&healthFailedNodes, 1)
-				appendResult(node, rpc, 0, 0, 0, 0, 0, 0, "bad")
+				addBad(node, rpc)
 				return
 			}
+			latency := float64(time.Since(start).Milliseconds())
 
-			// NEW: Check if snapshot is actually available before speed testing
 			available, ext := checkSnapshotAvailability(rpc)
 			if !available {
 				atomic.AddInt32(&snapshotUnavailableNodes, 1)
-				log.Printf("Node %s rejected: no snapshot endpoint available", rpc)
-				appendResult(node, rpc, 0, 0, 0, 0, 0, 0, "bad")
+				addBad(node, rpc)
 				return
 			}
 
-			baseURL, err := url.Parse(rpc)
+			candMu.Lock()
+			candidates = append(candidates, probeCandidate{node: node, rpc: rpc, ext: ext, latency: latency})
+			candMu.Unlock()
+		}(node)
+	}
+	wg.Wait()
+
+	log.Printf("Probe complete: %d/%d nodes healthy with a snapshot available (Health failed: %d, No snapshot: %d)",
+		len(candidates), len(nodes), healthFailedNodes, snapshotUnavailableNodes)
+
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].latency < candidates[j].latency })
+
+	speedTestLimit := cfg.SpeedTestCandidates
+	if speedTestLimit <= 0 {
+		speedTestLimit = 30
+	}
+	if len(candidates) > speedTestLimit {
+		log.Printf("Speed-testing the %d closest candidates by latency (skipping the rest to limit load on the network)", speedTestLimit)
+		candidates = candidates[:speedTestLimit]
+	}
+
+	// Phase B: real bandwidth speed test, only against the shortlisted candidates.
+	results := make(chan NodeEvaluationResult, len(candidates))
+	var goodNodes, slowNodes, badNodes int32
+
+	slotThreshold := cfg.FullThreshold
+	if slotThreshold == 0 {
+		slotThreshold = 25000 // Default fallback if not configured
+	}
+
+	for _, c := range candidates {
+		wg.Add(1)
+		go func(c probeCandidate) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			baseURL, err := url.Parse(c.rpc)
 			if err != nil {
-				appendResult(node, rpc, 0, 0, 0, 0, 0, 0, "bad")
+				results <- NodeEvaluationResult{RPC: c.rpc, Version: c.node.Version, Status: "bad"}
+				atomic.AddInt32(&badNodes, 1)
 				return
 			}
-
-			baseURL.Path = "/snapshot" + ext
+			baseURL.Path = "/snapshot" + c.ext
 			snapshotURL := baseURL.String()
 
 			speed, latency, err := MeasureSpeed(snapshotURL, cfg.SpeedTestSeconds)
 			if err != nil {
-				appendResult(node, rpc, speed, latency, 0, 0, 0, 0, "slow")
+				results <- NodeEvaluationResult{RPC: c.rpc, Version: c.node.Version, Status: "slow"}
+				atomic.AddInt32(&slowNodes, 1)
 				return
 			}
 
 			// Try to get highest snapshot slots first, fallback to regular slot
 			var slot, fullSlot, incrementalSlot int
-			if slots, err := GetHighestSnapshotSlots(rpc); err == nil {
+			if slots, err := GetHighestSnapshotSlots(c.rpc); err == nil {
 				fullSlot = slots.Full
 				incrementalSlot = slots.Incremental
 				slot = fullSlot // Use full slot as the reference
 			} else {
-				log.Printf("Node %s: getHighestSnapshotSlots failed, trying getSlot: %v", rpc, err)
-				slot, err = GetReferenceSlot(rpc)
+				log.Printf("Node %s: getHighestSnapshotSlots failed, trying getSlot: %v", c.rpc, err)
+				slot, err = GetReferenceSlot(c.rpc)
 				if err != nil {
-					appendResult(node, rpc, speed, latency, 0, 0, 0, 0, "slow")
+					results <- NodeEvaluationResult{RPC: c.rpc, Speed: speed, Latency: latency, Version: c.node.Version, Status: "slow"}
+					atomic.AddInt32(&slowNodes, 1)
 					return
 				}
 				fullSlot = slot
@@ -254,36 +251,35 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			// For node evaluation, we always prioritize finding nodes that can provide
 			// full snapshots within the full_threshold. The incremental threshold is only
 			// used later when we check local files and determine what's actually needed.
-			slotThreshold := cfg.FullThreshold
-			if slotThreshold == 0 {
-				slotThreshold = 25000 // Default fallback if not configured
-			}
 
 			// Strict slot validation: reject nodes outside the full threshold
 			// We want full snapshots as close as possible to current slot height
 			if diff > slotThreshold {
-				log.Printf("Node %s rejected: slot too old (diff: %d, max allowed: %d)", rpc, diff, slotThreshold)
-				appendResult(node, rpc, speed, latency, slot, fullSlot, incrementalSlot, diff, "bad")
+				log.Printf("Node %s rejected: slot too old (diff: %d, max allowed: %d)", c.rpc, diff, slotThreshold)
+				results <- NodeEvaluationResult{RPC: c.rpc, Speed: speed, Latency: latency, Slot: slot, FullSlot: fullSlot, IncrementalSlot: incrementalSlot, Diff: diff, Version: c.node.Version, Status: "bad"}
+				atomic.AddInt32(&badNodes, 1)
 				return
 			}
 
 			if speed >= float64(cfg.MinDownloadSpeed) && latency <= float64(cfg.MaxLatency) && diff <= slotThreshold {
 				status = "good"
+				atomic.AddInt32(&goodNodes, 1)
 			} else if speed == 0 || latency == 0 {
 				// Only mark as "bad" if completely failed (no speed or no latency response)
 				status = "bad"
+				atomic.AddInt32(&badNodes, 1)
+			} else {
+				atomic.AddInt32(&slowNodes, 1)
 			}
-			// Otherwise keep as "slow" for nodes that are functional but don't meet requirements
 
-			appendResult(node, rpc, speed, latency, slot, fullSlot, incrementalSlot, diff, status)
-		}(node)
+			results <- NodeEvaluationResult{RPC: c.rpc, Speed: speed, Latency: latency, Slot: slot, FullSlot: fullSlot, IncrementalSlot: incrementalSlot, Diff: diff, Version: c.node.Version, Status: status}
+		}(c)
 	}
 
 	wg.Wait()
-	done <- true
 	close(results)
 
-	var evaluatedResults []NodeEvaluationResult
+	evaluatedResults := append([]NodeEvaluationResult{}, badResults...)
 	for result := range results {
 		evaluatedResults = append(evaluatedResults, result)
 	}
@@ -298,13 +294,9 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 	})
 
 	log.Printf("Node evaluation complete: %d/%d nodes processed | Good: %d, Slow: %d, Bad: %d",
-		atomic.LoadInt32(&processedNodes), len(nodes),
-		atomic.LoadInt32(&goodNodes),
-		atomic.LoadInt32(&slowNodes),
-		atomic.LoadInt32(&badNodes))
+		len(evaluatedResults), len(nodes), goodNodes, slowNodes, int32(len(badResults))+badNodes)
 	log.Printf("Filtering breakdown: Health failed: %d, No snapshot endpoint: %d",
-		atomic.LoadInt32(&healthFailedNodes),
-		atomic.LoadInt32(&snapshotUnavailableNodes))
+		healthFailedNodes, snapshotUnavailableNodes)
 
 	// Log slot threshold information
 	log.Printf("Node evaluation: using full threshold %d slots for full snapshots (reference slot: %d)",
