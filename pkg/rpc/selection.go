@@ -75,6 +75,10 @@ func ParseRetryAfter(headers http.Header, now time.Time) (time.Duration, bool) {
 		if seconds < 0 {
 			return 0, false
 		}
+		const maxDurationSeconds = int64((1<<63)-1) / int64(time.Second)
+		if seconds > maxDurationSeconds {
+			return 0, false
+		}
 		return time.Duration(seconds) * time.Second, true
 	}
 	retryAt, err := http.ParseTime(value)

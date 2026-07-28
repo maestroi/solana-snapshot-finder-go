@@ -54,3 +54,36 @@ func TestWaitForRetrySleepsOnceAndClearsDelay(t *testing.T) {
 		t.Fatalf("RetryAfter = %v, want 0", cooldown.RetryAfter)
 	}
 }
+
+func TestHandleSafetyDownloadFailureExcludesWaitsAndRotates(t *testing.T) {
+	results := []rpc.NodeEvaluationResult{
+		{RPC: "http://limited", Speed: 100, Status: "good"},
+		{RPC: "http://other", Speed: 80, Status: "good"},
+	}
+	cooldown := &rpc.HostCooldown{}
+	statusErr := &snapshot.HTTPStatusError{
+		StatusCode: http.StatusTooManyRequests,
+		RetryAfter: 4 * time.Second,
+		URL:        "http://limited/incremental-snapshot.tar.zst",
+	}
+	var slept time.Duration
+
+	next := handleSafetyDownloadFailure(
+		results,
+		cooldown,
+		"http://limited",
+		"http://limited",
+		statusErr,
+		func(delay time.Duration) { slept = delay },
+	)
+
+	if next != "http://other" {
+		t.Fatalf("next RPC = %q, want %q", next, "http://other")
+	}
+	if !cooldown.IsExcluded("http://limited") {
+		t.Fatal("failed safety host was not excluded")
+	}
+	if slept != 4*time.Second {
+		t.Fatalf("slept for %v, want %v", slept, 4*time.Second)
+	}
+}

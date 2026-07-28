@@ -50,6 +50,15 @@ func TestParseRetryAfterHTTPDate(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfterRejectsDeltaSecondsOverflow(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Retry-After", "9223372036854775807")
+
+	if duration, ok := ParseRetryAfter(headers, time.Now()); ok {
+		t.Fatalf("ParseRetryAfter() = %v, true; want false for duration overflow", duration)
+	}
+}
+
 func TestMarkRetryAfterKeepsMax(t *testing.T) {
 	cooldown := &HostCooldown{}
 	cooldown.MarkRetryAfter("http://a", 2*time.Second)

@@ -75,6 +75,26 @@ func waitForRetry(cooldown *rpc.HostCooldown, sleep func(time.Duration)) {
 	sleep(delay)
 }
 
+func handleSafetyDownloadFailure(
+	results []rpc.NodeEvaluationResult,
+	cooldown *rpc.HostCooldown,
+	currentRPC string,
+	failedRPC string,
+	err error,
+	sleep func(time.Duration),
+) string {
+	recordDownloadFailure(cooldown, failedRPC, err)
+	nextRPC := currentRPC
+	if next := rpc.SelectNextRPC(results, cooldown); next != "" {
+		nextRPC = next
+	}
+	if nextRPC != currentRPC {
+		log.Printf("Switching from %s to %s", currentRPC, nextRPC)
+	}
+	waitForRetry(cooldown, sleep)
+	return nextRPC
+}
+
 func fullSlotForRPC(results []rpc.NodeEvaluationResult, rpcAddr string) int {
 	for _, r := range results {
 		if r.RPC == rpcAddr && r.FullSlot > 0 {
@@ -285,6 +305,14 @@ func processSnapshots(cfg config.Config) {
 						matchInfo.NodeRPC, matchInfo.BaseSlot, matchInfo.EndSlot)
 					if err := snapshot.DownloadSnapshot(matchInfo.NodeRPC, cfg, "incremental-", referenceSlot); err != nil {
 						log.Printf("Warning: Failed to download safety incremental: %v", err)
+						bestRPC = handleSafetyDownloadFailure(
+							results,
+							cooldown,
+							bestRPC,
+							matchInfo.NodeRPC,
+							err,
+							time.Sleep,
+						)
 					} else {
 						safetyIncrementalRPC = matchInfo.NodeRPC
 						log.Println("Safety incremental downloaded successfully")
