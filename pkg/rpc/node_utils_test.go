@@ -1,10 +1,66 @@
 package rpc
 
 import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 )
+
+func TestMeasureSpeedStopsAtByteCap(t *testing.T) {
+	var readBytes atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		if r.Header.Get("Range") == "" {
+			t.Errorf("expected Range header")
+		}
+		payload := bytes.Repeat([]byte("x"), 512*1024) // 512 KiB chunks
+		for {
+			n, err := w.Write(payload)
+			readBytes.Add(int64(n))
+			if err != nil {
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			if readBytes.Load() > 2*1024*1024 {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	speed, _, err := MeasureSpeed(srv.URL, 30, 256*1024) // 256 KiB cap, long time
+	if err != nil {
+		t.Fatal(err)
+	}
+	if speed <= 0 {
+		t.Fatalf("expected positive speed, got %v", speed)
+	}
+	// Server should not have been asked for multi-MiB if client stops at cap
+	if readBytes.Load() > 512*1024 {
+		t.Fatalf("client read too much: %d", readBytes.Load())
+	}
+}
+
+func TestMeasureSpeedFallsBackWithoutRange(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.Write(bytes.Repeat([]byte("y"), 64*1024))
+	}))
+	defer srv.Close()
+
+	if _, _, err := MeasureSpeed(srv.URL, 2, 32*1024); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestFilterResultsByMaxSlot(t *testing.T) {
 	results := []NodeEvaluationResult{

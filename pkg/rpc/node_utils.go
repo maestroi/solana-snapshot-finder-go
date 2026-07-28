@@ -126,63 +126,72 @@ type NodeEvaluationResult struct {
 	Status          string  `json:"status"`
 }
 
-func MeasureSpeed(url string, measureTime int) (float64, float64, error) {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+func MeasureSpeed(url string, measureTime int, maxBytes int64) (speedMBs float64, latencyMs float64, err error) {
+	timeout := 10 * time.Second
+	if measureTime > 0 {
+		timeout += time.Duration(measureTime) * time.Second
+	}
+	client := &http.Client{Timeout: timeout}
+
+	requestStart := time.Now()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create request: %v", err)
+	}
+	if maxBytes > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", maxBytes-1))
 	}
 
-	startTime := time.Now()
-	resp, err := client.Get(url)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to fetch URL: %v", err)
 	}
-	defer resp.Body.Close()
-	latency := time.Since(startTime).Milliseconds()
 
+	rangeAccepted := resp.StatusCode == http.StatusPartialContent ||
+		(resp.StatusCode == http.StatusOK && strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes"))
+	if maxBytes > 0 && !rangeAccepted {
+		resp.Body.Close()
+		requestStart = time.Now()
+		resp, err = client.Get(url)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to fetch URL without Range: %v", err)
+		}
+	}
+	defer resp.Body.Close()
+
+	latencyMs = float64(time.Since(requestStart).Milliseconds())
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return 0, latencyMs, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
+	}
+
+	start := time.Now()
+	deadline := time.Duration(measureTime) * time.Second
 	buffer := make([]byte, 81920)
 	var totalLoaded int64
-	var speeds []float64
 
-	lastTime := time.Now()
-	for time.Since(startTime).Seconds() < float64(measureTime) {
-		n, err := resp.Body.Read(buffer)
-		if n > 0 {
-			totalLoaded += int64(n)
+	for time.Since(start) < deadline && (maxBytes <= 0 || totalLoaded < maxBytes) {
+		readBuffer := buffer
+		if maxBytes > 0 && int64(len(readBuffer)) > maxBytes-totalLoaded {
+			readBuffer = readBuffer[:maxBytes-totalLoaded]
 		}
-		if err == io.EOF {
+
+		n, readErr := resp.Body.Read(readBuffer)
+		totalLoaded += int64(n)
+		if readErr == io.EOF {
 			break
 		}
-		if err != nil {
-			return 0, float64(latency), fmt.Errorf("error reading response body: %v", err)
-		}
-
-		elapsed := time.Since(lastTime).Seconds()
-		if elapsed >= 1 {
-			speed := float64(totalLoaded) / elapsed
-			speeds = append(speeds, speed)
-			lastTime = time.Now()
-			totalLoaded = 0
+		if readErr != nil {
+			return 0, latencyMs, fmt.Errorf("error reading response body: %v", readErr)
 		}
 	}
 
-	if len(speeds) == 0 {
-		return 0, float64(latency), fmt.Errorf("no data collected during the measurement period")
+	elapsed := time.Since(start).Seconds()
+	if totalLoaded == 0 || elapsed == 0 {
+		return 0, latencyMs, fmt.Errorf("no data collected during the measurement period")
 	}
 
-	medianSpeed := calculateMedian(speeds) / (1024 * 1024)
-	return medianSpeed, float64(latency), nil
-}
-
-func calculateMedian(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	n := len(values)
-	sort.Float64s(values)
-	if n%2 == 0 {
-		return (values[n/2-1] + values[n/2]) / 2
-	}
-	return values[n/2]
+	speedMBs = float64(totalLoaded) / elapsed / (1024 * 1024)
+	return speedMBs, latencyMs, nil
 }
 
 func normalizeRPCBase(rpc string) string {
@@ -322,7 +331,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 				return
 			}
 
-			speed, latency, err := MeasureSpeed(snapshotURL, cfg.SpeedTestSeconds)
+			speed, latency, err := MeasureSpeed(snapshotURL, cfg.SpeedTestSeconds, cfg.SpeedTestMaxBytes)
 			if err != nil {
 				results <- NodeEvaluationResult{RPC: c.rpc, Version: c.node.Version, Status: "slow"}
 				atomic.AddInt32(&slowNodes, 1)
