@@ -2,7 +2,7 @@
 
 Date: 2026-07-28  
 Branch context: `perf/reduce-node-probe-load`  
-Status: Revised after second consistency pass — pending re-approval for planning
+Status: Approved for planning
 
 ## Goals
 
@@ -114,6 +114,7 @@ Implementers must not “fold” `ProbeIncrementalInfo` into Phase A/B, remove i
 - When active: probe warm-start addresses first so healthy ones tend to appear earlier in the latency shortlist
 - Always still fetch and probe the full cluster list afterward — cache never replaces discovery
 - Missing/unreadable cache is ignored quietly
+- **Staleness:** no age cutoff on the cache file in this pass. Dead warm-start addresses only waste a few Phase A health checks; discovery still runs. A future `warm_start_max_age` knob is deferred if operators want it.
 
 ### Phase B — speed test
 
@@ -124,7 +125,7 @@ Implementers must not “fold” `ProbeIncrementalInfo` into Phase A/B, remove i
   - If Range is rejected (or unsupported status), fall back to a normal GET with the same stop rules
   - Stop when **either** `speed_test_seconds` elapses **or** `speed_test_max_bytes` is reached
   - Compute MB/s from bytes / elapsed so ~500 MB/s links still get a meaningful sample
-- **Full slot tie-break:** if Phase A already derived a slot from the full-snapshot HEAD/redirect filename, **HEAD wins** — do not call RPC to reconcile, and do not cross-check against `getHighestSnapshotSlots`. Rationale: the download follows the same HTTP redirect, so the HEAD filename is the artifact that will be served; RPC metadata can disagree and is less relevant for what we pull. If no HEAD-derived slot exists, fall back to `getHighestSnapshotSlots` / `getSlot` as today.
+- **Full slot tie-break:** if Phase A already derived a slot from the full-snapshot HEAD/redirect filename, **HEAD wins** — do not call RPC to reconcile, and do not cross-check against `getHighestSnapshotSlots`. Treat that value as a **selection-time snapshot**, not a guarantee the same file will still be served at download time (snapshots rotate; see Non-goals). Preferring HEAD still avoids an extra RPC when the probe already saw a filename, and post-download filename/slot checks remain the correctness backstop for whatever actually lands. If no HEAD-derived slot exists, fall back to `getHighestSnapshotSlots` / `getSlot` as today.
 - **IncrementalSlot (evaluation only):** always from `getHighestSnapshotSlots`. Never from incremental HEAD during Phase B. Post-selection `ProbeIncrementalInfo` is unchanged and separate (see table above).
 - Slot threshold (`full_threshold`) stays strict — never relaxed
 
@@ -200,3 +201,4 @@ Existing relaxation, threshold, whitelist, and download-retry knobs remain uncha
 - Early exit from Phase B once N good nodes exist
 - Lower default `speed_test_candidates` after measuring production impact
 - Dedicated `nodes_cache.json` (rejected in favor of reusing `nodes_attempt_*.json`)
+- `warm_start_max_age` / cache file age cutoff
