@@ -6,6 +6,34 @@ import (
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 )
 
+func TestFilterResultsByMaxSlot(t *testing.T) {
+	results := []NodeEvaluationResult{
+		{RPC: "a", FullSlot: 100, Speed: 50, Status: "good"},
+		{RPC: "b", FullSlot: 200, Speed: 80, Status: "good"},
+		{RPC: "c", FullSlot: 200, Speed: 90, Status: "good"},
+		{RPC: "d", FullSlot: 300, Speed: 100, Status: "good"},
+		{RPC: "e", FullSlot: 0, Speed: 120, Status: "good"},
+	}
+
+	filtered := FilterResultsByMaxSlot(results, 250)
+	if len(filtered) != 2 {
+		t.Fatalf("expected 2 nodes at newest slot <= 250, got %d", len(filtered))
+	}
+	for _, r := range filtered {
+		if r.FullSlot != 200 {
+			t.Errorf("expected FullSlot 200, got %d for %s", r.FullSlot, r.RPC)
+		}
+	}
+
+	if got := FilterResultsByMaxSlot(results, 0); len(got) != len(results) {
+		t.Errorf("maxSlot 0 should return results unchanged, got %d want %d", len(got), len(results))
+	}
+
+	if got := FilterResultsByMaxSlot(results, 50); got != nil {
+		t.Errorf("expected nil when no nodes match, got %v", got)
+	}
+}
+
 func TestRelaxationFactors(t *testing.T) {
 	cfg := config.Config{
 		MinDownloadSpeed:        100,

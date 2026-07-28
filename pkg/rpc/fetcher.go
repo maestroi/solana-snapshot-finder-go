@@ -18,8 +18,40 @@ var DEFAULT_HEADERS = map[string]string{
 }
 
 type RPCNode struct {
-	Address string
-	Version string
+	Address  string
+	Version  string
+	IsStatic bool // true for static snapshot URLs (e.g. https://host/mainnet-beta/)
+}
+
+// isStaticSnapshotURL detects if a URL is a direct snapshot endpoint rather than an RPC.
+func isStaticSnapshotURL(url string) bool {
+	return strings.HasSuffix(url, "/") ||
+		strings.Contains(url, "/snapshot") ||
+		strings.Contains(url, "/incremental")
+}
+
+// parseWhitelist converts whitelist entries into RPCNode structs.
+func parseWhitelist(whitelist []string) []RPCNode {
+	var nodes []RPCNode
+	for _, entry := range whitelist {
+		if entry == "" {
+			continue
+		}
+		if isStaticSnapshotURL(entry) {
+			nodes = append(nodes, RPCNode{
+				Address:  entry,
+				Version:  "whitelist-static",
+				IsStatic: true,
+			})
+		} else {
+			nodes = append(nodes, RPCNode{
+				Address:  entry,
+				Version:  "whitelist-rpc",
+				IsStatic: false,
+			})
+		}
+	}
+	return nodes
 }
 
 // tryEndpoints calls fn with each endpoint in order, returning the first success.
@@ -247,8 +279,52 @@ func GetHighestSnapshotSlotsFromAny(endpoints []string) (SnapshotSlots, error) {
 	return tryEndpoints(endpoints, GetHighestSnapshotSlots)
 }
 
-// FetchRPCNodes fetches RPC nodes, trying each configured endpoint on every attempt.
+// mergeWhitelist applies whitelist_mode on top of discovered cluster nodes.
+func mergeWhitelist(clusterNodes []RPCNode, cfg config.Config) ([]RPCNode, error) {
+	mode := cfg.WhitelistMode
+	validModes := map[string]bool{"only": true, "additional": true, "disabled": true}
+	if !validModes[mode] {
+		log.Printf("Warning: Invalid whitelist_mode '%s', defaulting to 'additional'", mode)
+		mode = "additional"
+	}
+
+	whitelistNodes := parseWhitelist(cfg.Whitelist)
+
+	switch mode {
+	case "only":
+		if len(whitelistNodes) == 0 {
+			return nil, fmt.Errorf("whitelist_mode is 'only' but whitelist is empty")
+		}
+		log.Printf("Using whitelist-only mode with %d entries", len(whitelistNodes))
+		return whitelistNodes, nil
+	case "additional":
+		if len(whitelistNodes) > 0 {
+			log.Printf("Adding %d whitelist entries to %d cluster nodes", len(whitelistNodes), len(clusterNodes))
+			return append(clusterNodes, whitelistNodes...), nil
+		}
+		return clusterNodes, nil
+	default: // disabled
+		return clusterNodes, nil
+	}
+}
+
+// FetchRPCNodes fetches RPC nodes, trying each configured endpoint on every attempt,
+// then merges configured whitelist sources according to whitelist_mode.
 func FetchRPCNodes(cfg config.Config) []RPCNode {
+	mode := cfg.WhitelistMode
+	if mode == "" {
+		mode = "additional"
+	}
+
+	// Whitelist-only: skip cluster discovery entirely
+	if mode == "only" {
+		nodes, err := mergeWhitelist(nil, cfg)
+		if err != nil {
+			log.Fatalf("Failed to build whitelist sources: %v", err)
+		}
+		return nodes
+	}
+
 	endpoints := cfg.RPCEndpoints()
 	var nodes []RPCNode
 	var err error
@@ -260,11 +336,21 @@ func FetchRPCNodes(cfg config.Config) []RPCNode {
 		})
 		if err == nil && len(nodes) > 0 {
 			log.Printf("Fetched %d RPC nodes on attempt %d.", len(nodes), attempt)
-			return nodes
+			merged, mergeErr := mergeWhitelist(nodes, cfg)
+			if mergeErr != nil {
+				log.Fatalf("Failed to merge whitelist: %v", mergeErr)
+			}
+			return merged
 		}
 
 		log.Printf("Attempt %d/%d to fetch RPC nodes failed: %v", attempt, cfg.NumOfRetries, err)
 		time.Sleep(2 * time.Second) // Add delay between retries
+	}
+
+	// Cluster discovery failed - fall back to whitelist if configured
+	if whitelistNodes := parseWhitelist(cfg.Whitelist); len(whitelistNodes) > 0 {
+		log.Printf("Cluster discovery failed; falling back to %d whitelist entries", len(whitelistNodes))
+		return whitelistNodes
 	}
 
 	if err != nil {

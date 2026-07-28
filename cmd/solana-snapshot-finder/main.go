@@ -15,6 +15,7 @@ func main() {
 	// Parse command-line arguments
 	configPath := flag.String("config", "./config.yaml", "Path to the configuration file directory")
 	versionFlag := flag.Bool("version", false, "Show version information")
+	maxSlot := flag.Int64("max-slot", 0, "Find the newest snapshot with slot <= this value (0 = disabled, find latest)")
 	flag.Parse()
 
 	// If version flag is passed, print the version and exit
@@ -30,6 +31,12 @@ func main() {
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Override MaxSlot from command-line flag if provided
+	if *maxSlot > 0 {
+		cfg.MaxSlot = *maxSlot
+		log.Printf("Using max slot from command-line flag: %d", cfg.MaxSlot)
 	}
 
 	log.Println("Starting Solana Snapshot Finder...")

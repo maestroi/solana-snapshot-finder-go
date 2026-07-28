@@ -12,7 +12,7 @@ num_of_retries: 5
 sleep_before_retry: 5
 private_rpc: false
 worker_count: 100
-full_threshold: 100000
+full_threshold: 100000            # Agave 3.x: ~100k slots after full
 incremental_threshold: 500
 # How many latency-shortlisted candidates get a real speed test per attempt.
 # Keep this small - it's the only phase that pulls real bandwidth from other nodes.
@@ -21,6 +21,24 @@ speed_relaxation_factor: 0.9
 latency_relaxation_factor: 0.9
 max_relaxation_attempts: 3
 max_download_retries: 3
+
+# Preferred snapshot sources (RPC endpoints or static HTTP URLs ending with /)
+# whitelist:
+#   - "https://snapshots.example.com/mainnet-beta/"
+#   - "http://custom-node:8899"
+whitelist: []
+whitelist_mode: "additional"      # "only", "additional", or "disabled"
+
+# Download a matching incremental before the full snapshot so a usable
+# incremental exists if the full download outlives the expiry window.
+download_incremental_first: true
+
+# Keep at most N full snapshots in snapshot_path (0 = unlimited)
+max_full_snapshots: 2
+
+# Find newest snapshot with slot <= this value (0 = disabled, find latest)
+# max_slot: 0
+
 denylist:
   - "192.168.1.100"
   - "10.0.0.5"

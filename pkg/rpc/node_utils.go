@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +19,99 @@ import (
 
 	"github.com/maestroi/solana-snapshot-finder-go/pkg/config"
 )
+
+var incrementalFilenameRe = regexp.MustCompile(`incremental-snapshot-(\d+)-(\d+)-[a-zA-Z0-9]+\.tar\.(zst|bz2)`)
+
+// IncrementalInfo describes a probed incremental snapshot on a node.
+type IncrementalInfo struct {
+	NodeRPC  string
+	BaseSlot int
+	EndSlot  int
+	Filename string
+}
+
+// ProbeIncrementalInfo follows redirects on a node's incremental snapshot endpoint
+// to learn the base/end slots from the filename. Used for matching before downloads.
+func ProbeIncrementalInfo(rpcAddress string) (*IncrementalInfo, error) {
+	base := normalizeRPCBase(rpcAddress)
+	client := &http.Client{Timeout: 8 * time.Second}
+	extensions := []string{".tar.zst", ".tar.bz2"}
+
+	var lastErr error
+	for _, ext := range extensions {
+		snapshotURL := base + "/incremental-snapshot" + ext
+		resp, err := client.Head(snapshotURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d for %s", resp.StatusCode, snapshotURL)
+			resp.Body.Close()
+			continue
+		}
+
+		fileName := filepath.Base(resp.Request.URL.String())
+		if cd := resp.Header.Get("Content-Disposition"); strings.Contains(cd, "filename=") {
+			fileName = strings.Trim(strings.Split(cd, "filename=")[1], `"' `)
+		}
+		resp.Body.Close()
+
+		match := incrementalFilenameRe.FindStringSubmatch(fileName)
+		if match == nil {
+			lastErr = fmt.Errorf("invalid incremental filename: %s", fileName)
+			continue
+		}
+		baseSlot, err1 := strconv.Atoi(match[1])
+		endSlot, err2 := strconv.Atoi(match[2])
+		if err1 != nil || err2 != nil {
+			lastErr = fmt.Errorf("failed to parse slots from %s", fileName)
+			continue
+		}
+		return &IncrementalInfo{
+			NodeRPC:  base,
+			BaseSlot: baseSlot,
+			EndSlot:  endSlot,
+			Filename: fileName,
+		}, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no incremental snapshot at %s", rpcAddress)
+}
+
+// FindMatchingIncremental searches evaluated nodes (fastest first) for an incremental
+// whose base slot matches fullSnapshotSlot.
+func FindMatchingIncremental(results []NodeEvaluationResult, fullSnapshotSlot int) (*IncrementalInfo, error) {
+	if fullSnapshotSlot <= 0 {
+		return nil, fmt.Errorf("invalid full snapshot slot: %d", fullSnapshotSlot)
+	}
+
+	// Prefer good, then slow, already roughly sorted by speed from evaluation.
+	var candidates []NodeEvaluationResult
+	for _, r := range results {
+		if r.Status == "good" || r.Status == "slow" {
+			candidates = append(candidates, r)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Speed > candidates[j].Speed })
+
+	log.Printf("Searching for incremental with base slot %d across %d nodes...", fullSnapshotSlot, len(candidates))
+	for i, node := range candidates {
+		info, err := ProbeIncrementalInfo(node.RPC)
+		if err != nil {
+			continue
+		}
+		if info.BaseSlot == fullSnapshotSlot {
+			log.Printf("  Node %d/%d (%s): match found (base=%d, end=%d)",
+				i+1, len(candidates), node.RPC, info.BaseSlot, info.EndSlot)
+			return info, nil
+		}
+	}
+	return nil, fmt.Errorf("no incremental with base slot %d found", fullSnapshotSlot)
+}
 
 // NodeEvaluationResult represents the result of evaluating an RPC node
 type NodeEvaluationResult struct {
@@ -89,9 +185,16 @@ func calculateMedian(values []float64) float64 {
 	return values[n/2]
 }
 
+func normalizeRPCBase(rpc string) string {
+	if !strings.HasPrefix(rpc, "http://") && !strings.HasPrefix(rpc, "https://") {
+		rpc = "http://" + rpc
+	}
+	return strings.TrimRight(rpc, "/")
+}
+
 func checkHealth(rpc string) bool {
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(rpc + "/health")
+	resp, err := client.Get(normalizeRPCBase(rpc) + "/health")
 	if err != nil {
 		return false
 	}
@@ -103,9 +206,10 @@ func checkHealth(rpc string) bool {
 // test hits the same URL that was just confirmed available.
 func checkSnapshotAvailability(rpc string) (bool, string) {
 	client := &http.Client{Timeout: 3 * time.Second}
+	base := normalizeRPCBase(rpc)
 	extensions := []string{".tar.bz2", ".tar.zst"}
 	for _, ext := range extensions {
-		snapshotURL := rpc + "/snapshot" + ext
+		snapshotURL := base + "/snapshot" + ext
 		resp, err := client.Head(snapshotURL)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			resp.Body.Close()
@@ -154,16 +258,16 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			rpc := node.Address
-			if !strings.HasPrefix(rpc, "http://") && !strings.HasPrefix(rpc, "https://") {
-				rpc = "http://" + rpc
-			}
+			rpc := normalizeRPCBase(node.Address)
 
 			start := time.Now()
-			if !checkHealth(rpc) {
-				atomic.AddInt32(&healthFailedNodes, 1)
-				addBad(node, rpc)
-				return
+			// Static whitelist URLs are HTTP snapshot hosts, not Solana RPCs — skip /health.
+			if !node.IsStatic {
+				if !checkHealth(rpc) {
+					atomic.AddInt32(&healthFailedNodes, 1)
+					addBad(node, rpc)
+					return
+				}
 			}
 			latency := float64(time.Since(start).Milliseconds())
 
@@ -201,7 +305,7 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 
 	slotThreshold := cfg.FullThreshold
 	if slotThreshold == 0 {
-		slotThreshold = 25000 // Default fallback if not configured
+		slotThreshold = 100000 // Default fallback if not configured (Agave 3.x)
 	}
 
 	for _, c := range candidates {
@@ -211,14 +315,12 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			baseURL, err := url.Parse(c.rpc)
-			if err != nil {
+			snapshotURL := normalizeRPCBase(c.rpc) + "/snapshot" + c.ext
+			if _, err := url.Parse(snapshotURL); err != nil {
 				results <- NodeEvaluationResult{RPC: c.rpc, Version: c.node.Version, Status: "bad"}
 				atomic.AddInt32(&badNodes, 1)
 				return
 			}
-			baseURL.Path = "/snapshot" + c.ext
-			snapshotURL := baseURL.String()
 
 			speed, latency, err := MeasureSpeed(snapshotURL, cfg.SpeedTestSeconds)
 			if err != nil {
@@ -227,9 +329,14 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 				return
 			}
 
-			// Try to get highest snapshot slots first, fallback to regular slot
+			// Try to get highest snapshot slots first, fallback to regular slot.
+			// Static whitelist hosts are not Solana RPCs — treat them as trusted (diff=0).
 			var slot, fullSlot, incrementalSlot int
-			if slots, err := GetHighestSnapshotSlots(c.rpc); err == nil {
+			if c.node.IsStatic {
+				slot = defaultSlot
+				fullSlot = defaultSlot
+				incrementalSlot = defaultSlot
+			} else if slots, err := GetHighestSnapshotSlots(c.rpc); err == nil {
 				fullSlot = slots.Full
 				incrementalSlot = slots.Incremental
 				slot = fullSlot // Use full slot as the reference
@@ -252,16 +359,25 @@ func EvaluateNodesWithVersions(nodes []RPCNode, cfg config.Config, defaultSlot i
 			// full snapshots within the full_threshold. The incremental threshold is only
 			// used later when we check local files and determine what's actually needed.
 
-			// Strict slot validation: reject nodes outside the full threshold
-			// We want full snapshots as close as possible to current slot height
-			if diff > slotThreshold {
+			if cfg.MaxSlot > 0 && !c.node.IsStatic {
+				// Historical mode: accept snapshots at or before max_slot; reject newer ones.
+				if fullSlot <= 0 || int64(fullSlot) > cfg.MaxSlot {
+					log.Printf("Node %s rejected: full slot %d is missing or above max_slot %d", c.rpc, fullSlot, cfg.MaxSlot)
+					results <- NodeEvaluationResult{RPC: c.rpc, Speed: speed, Latency: latency, Slot: slot, FullSlot: fullSlot, IncrementalSlot: incrementalSlot, Diff: diff, Version: c.node.Version, Status: "bad"}
+					atomic.AddInt32(&badNodes, 1)
+					return
+				}
+			} else if !c.node.IsStatic && diff > slotThreshold {
+				// Strict slot validation: reject nodes outside the full threshold.
+				// We want full snapshots as close as possible to current slot height.
 				log.Printf("Node %s rejected: slot too old (diff: %d, max allowed: %d)", c.rpc, diff, slotThreshold)
 				results <- NodeEvaluationResult{RPC: c.rpc, Speed: speed, Latency: latency, Slot: slot, FullSlot: fullSlot, IncrementalSlot: incrementalSlot, Diff: diff, Version: c.node.Version, Status: "bad"}
 				atomic.AddInt32(&badNodes, 1)
 				return
 			}
 
-			if speed >= float64(cfg.MinDownloadSpeed) && latency <= float64(cfg.MaxLatency) && diff <= slotThreshold {
+			slotOK := c.node.IsStatic || cfg.MaxSlot > 0 || diff <= slotThreshold
+			if speed >= float64(cfg.MinDownloadSpeed) && latency <= float64(cfg.MaxLatency) && slotOK {
 				status = "good"
 				atomic.AddInt32(&goodNodes, 1)
 			} else if speed == 0 || latency == 0 {
@@ -444,4 +560,45 @@ func SelectBestRPC(results []NodeEvaluationResult) string {
 
 	// Return empty string to continue retry loop with relaxed requirements
 	return ""
+}
+
+// FilterResultsByMaxSlot keeps nodes with FullSlot <= maxSlot, retaining only those
+// that share the newest such FullSlot. Useful for historical snapshot selection.
+// If maxSlot <= 0, results are returned unchanged.
+func FilterResultsByMaxSlot(results []NodeEvaluationResult, maxSlot int64) []NodeEvaluationResult {
+	if maxSlot <= 0 {
+		return results
+	}
+
+	var filtered []NodeEvaluationResult
+	matching := 0
+
+	for _, candidate := range results {
+		if candidate.FullSlot <= 0 || int64(candidate.FullSlot) > maxSlot {
+			continue
+		}
+
+		matching++
+
+		if len(filtered) == 0 {
+			filtered = []NodeEvaluationResult{candidate}
+			continue
+		}
+
+		currentSlot := filtered[0].FullSlot
+		if candidate.FullSlot == currentSlot {
+			filtered = append(filtered, candidate)
+		} else if candidate.FullSlot > currentSlot {
+			filtered = []NodeEvaluationResult{candidate}
+		}
+	}
+
+	if len(filtered) == 0 {
+		log.Printf("WARNING: No nodes found with snapshots at or before slot %d", maxSlot)
+		return nil
+	}
+
+	log.Printf("Found %d nodes with snapshots at or before slot %d", matching, maxSlot)
+	log.Printf("Selecting newest available slot: %d (%d nodes have this snapshot)", filtered[0].FullSlot, len(filtered))
+	return filtered
 }

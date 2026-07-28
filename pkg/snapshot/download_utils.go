@@ -106,10 +106,21 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 		return "", 0, fmt.Errorf("snapshot request returned status %d for %s", resp.StatusCode, snapshotURL)
 	}
 
+	// Abort early if Content-Length says we don't have enough free space
+	if resp.ContentLength > 0 {
+		ok, err := CheckDiskSpaceForDownload(baseDir, uint64(resp.ContentLength))
+		if err != nil {
+			log.Printf("Warning: Could not verify disk space: %v", err)
+		} else if !ok {
+			return "", 0, fmt.Errorf("insufficient disk space for download of %s", FormatBytes(uint64(resp.ContentLength)))
+		}
+	}
+
 	// Get the final URL after redirects
 	finalURL := resp.Request.URL.String()
 	fileName := filepath.Base(finalURL)
-	log.Printf("Original filename from URL: %s", fileName)
+	log.Printf("Original final URL: %s", finalURL)
+	log.Printf("Original filename from final URL: %s", fileName)
 
 	if fileName == "" {
 		return "", 0, fmt.Errorf("invalid file name parsed from URL: %s", finalURL)
@@ -228,6 +239,11 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 	var sizeBytes int64
 	downloadErr := fmt.Errorf("no extension returned HTTP 200 from %s", rpcAddress)
 
+	rpcBase := strings.TrimRight(rpcAddress, "/")
+	if !strings.HasPrefix(rpcBase, "http://") && !strings.HasPrefix(rpcBase, "https://") {
+		rpcBase = "http://" + rpcBase
+	}
+
 	// NOTE: no HEAD pre-check here. The node was already probed (health, snapshot
 	// availability, speed) during evaluation, so an extra HEAD right before the
 	// real download just doubles our request rate against the same IP and risks
@@ -236,9 +252,9 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 	for _, ext := range extensions {
 		var snapshotURL string
 		if strings.HasPrefix(snapshotType, "incremental") {
-			snapshotURL = fmt.Sprintf("%s/incremental-snapshot%s", rpcAddress, ext)
+			snapshotURL = fmt.Sprintf("%s/incremental-snapshot%s", rpcBase, ext)
 		} else {
-			snapshotURL = fmt.Sprintf("%s/snapshot%s", rpcAddress, ext)
+			snapshotURL = fmt.Sprintf("%s/snapshot%s", rpcBase, ext)
 		}
 		log.Printf("Trying URL: %s", snapshotURL)
 
@@ -258,7 +274,14 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 				downloadErr = err
 				continue
 			}
-			if existingSlot > 0 && remoteSlot <= existingSlot {
+			if cfg.MaxSlot > 0 {
+				if int64(remoteSlot) > cfg.MaxSlot {
+					log.Printf("Remote snapshot (slot %d) exceeds max_slot %d. Discarding.", remoteSlot, cfg.MaxSlot)
+					os.Remove(finalPath)
+					downloadErr = fmt.Errorf("remote snapshot slot %d exceeds max_slot %d", remoteSlot, cfg.MaxSlot)
+					continue
+				}
+			} else if existingSlot > 0 && remoteSlot <= existingSlot {
 				log.Printf("Remote snapshot (slot %d) is not newer than existing snapshot (slot %d). Discarding.",
 					remoteSlot, existingSlot)
 				os.Remove(finalPath)
@@ -289,7 +312,16 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 		}
 
 		// Double-check that downloaded slot matches what we expected
-		if existingSlot > 0 && downloadedSlot <= existingSlot {
+		if cfg.MaxSlot > 0 {
+			if int64(downloadedSlot) > cfg.MaxSlot {
+				log.Printf("Warning: Downloaded snapshot (slot %d) exceeds max_slot %d. Removing.",
+					downloadedSlot, cfg.MaxSlot)
+				if err := os.Remove(finalPath); err != nil {
+					log.Printf("Warning: Failed to remove out-of-range downloaded snapshot: %v", err)
+				}
+				return fmt.Errorf("downloaded snapshot slot %d exceeds max_slot %d", downloadedSlot, cfg.MaxSlot)
+			}
+		} else if existingSlot > 0 && downloadedSlot <= existingSlot {
 			log.Printf("Warning: Downloaded snapshot (slot %d) is not newer than existing snapshot (slot %d). Removing redundant download.",
 				downloadedSlot, existingSlot)
 			// Remove the downloaded file since it's not newer
@@ -299,7 +331,7 @@ func DownloadSnapshot(rpcAddress string, cfg config.Config, snapshotType string,
 			return nil
 		}
 
-		if downloadedSlot < referenceSlot-cfg.FullThreshold {
+		if cfg.MaxSlot <= 0 && downloadedSlot < referenceSlot-cfg.FullThreshold {
 			log.Printf("Warning: Downloaded snapshot might be old, but keeping it anyway")
 		}
 	} else {
