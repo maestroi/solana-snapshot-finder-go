@@ -99,3 +99,29 @@ func TestDownloadSnapshotKeepsIncrementalMatchingLocalFull(t *testing.T) {
 		t.Fatalf("matching incremental stat error = %v, want file present", statErr)
 	}
 }
+
+// Real Solana genesis archives are tens of KB (testnet ~20-46KB), not multi-MB.
+// The 1MB floor that protects snapshot downloads must not reject genesis.
+func TestDownloadGenesisAcceptsSmallArchive(t *testing.T) {
+	body := bytes.Repeat([]byte("g"), 20009)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/genesis.tar.bz2" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	if err := DownloadGenesis(server.URL, dir); err != nil {
+		t.Fatalf("DownloadGenesis() error = %v, want nil for %d-byte genesis", err, len(body))
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "genesis.tar.bz2"))
+	if err != nil {
+		t.Fatalf("read genesis: %v", err)
+	}
+	if len(got) != len(body) {
+		t.Fatalf("genesis size = %d, want %d", len(got), len(body))
+	}
+}

@@ -210,9 +210,13 @@ func writeSnapshotToFile(snapshotURL, tmpDir, baseDir string, genesis bool) (str
 	tmpFile.Close()
 	log.Printf("Download completed to temporary file. Size: %d bytes", totalBytes)
 
-	// ponytail: 1MB floor — any real Solana snapshot is hundreds of MB
-	const minSnapshotBytes = 1 << 20
-	if totalBytes < minSnapshotBytes {
+	// Full/incremental snapshots are hundreds of MB; genesis.tar.bz2 is tens of KB
+	// (testnet ~20-46KB). Applying the 1MB floor to genesis rejects real archives.
+	minBytes := int64(1 << 20) // 1 MiB
+	if genesis {
+		minBytes = 1024 // reject empty/HTML error bodies, not real genesis
+	}
+	if totalBytes < minBytes {
 		os.Remove(tmpFilePath)
 		return "", 0, fmt.Errorf("downloaded file is too small (%d bytes), likely an error response", totalBytes)
 	}
